@@ -1,0 +1,28 @@
+{
+  "name": "mini-claude-code-router",
+  "version": "0.1.0",
+  "description": "Minimal gateway for Claude Code",
+  "type": "module",
+  "bin": {
+    "mccr": "./dist/cli.js"
+  },
+  "scripts": {
+    "build": "esbuild src/cli.ts --bundle --platform=node --format=esm --outfile=dist/cli.js --banner:js=\"#!/usr/bin/env node\"",
+    "dev": "tsx src/cli.ts",
+    "test": "vitest",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@the-next-ai/ai-gateway": "^1.0.3"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "esbuild": "^0.27.7",
+    "tsx": "^4.19.2",
+    "typescript": "^5.9.3",
+    "vitest": "^3.0.4"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}
