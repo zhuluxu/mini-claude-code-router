@@ -68,6 +68,21 @@ async function handleRequest(
     return;
   }
 
+  // Models list endpoint
+  if (path === "/v1/models" && method === "GET") {
+    const models = config.providers.flatMap((provider) =>
+      provider.models.map((model) => ({
+        id: `${provider.name}/${model}`,
+        object: "model",
+        created: Date.now(),
+        owned_by: provider.name
+      }))
+    );
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ object: "list", data: models }));
+    return;
+  }
+
   // Core endpoint: POST /v1/messages
   if (path === "/v1/messages" && method === "POST") {
     console.log(`\n[${new Date().toISOString()}] Incoming request: ${method} ${path}`);
