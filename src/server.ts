@@ -7,16 +7,45 @@ import { logRequest, initLogger } from "./logger.js";
 export async function startServer(config: Config): Promise<HttpServer> {
   initLogger(config.logging);
 
+  // Print startup information
+  printStartupInfo(config);
+
   const server = createServer(async (req, res) => {
     await handleRequest(req, res, config);
   });
 
   return new Promise((resolve) => {
     server.listen(config.server.port, config.server.host, () => {
-      console.log(`Gateway listening on http://${config.server.host}:${config.server.port}`);
+      console.log(`\nGateway listening on http://${config.server.host}:${config.server.port}`);
+      console.log("Ready to accept requests.\n");
       resolve(server);
     });
   });
+}
+
+function printStartupInfo(config: Config): void {
+  console.log("=".repeat(60));
+  console.log("Mini Claude Code Router - Starting");
+  console.log("=".repeat(60));
+  console.log(`\nServer: http://${config.server.host}:${config.server.port}`);
+  console.log(`Default Model: ${config.router.defaultModel}`);
+
+  console.log("\nProviders:");
+  for (const provider of config.providers) {
+    console.log(`  - ${provider.name} (${provider.type})`);
+    console.log(`    Base URL: ${provider.baseUrl}`);
+    console.log(`    Models: ${provider.models.join(", ")}`);
+  }
+
+  if (config.router.fallback.length > 0) {
+    console.log("\nFallback Chain:");
+    config.router.fallback.forEach((model, i) => {
+      console.log(`  ${i + 1}. ${model}`);
+    });
+  }
+
+  console.log(`\nLogging: ${config.logging.enabled ? "enabled" : "disabled"} (${config.logging.level})`);
+  console.log("=".repeat(60));
 }
 
 async function handleRequest(
@@ -37,7 +66,17 @@ async function handleRequest(
 
   // Core endpoint: POST /v1/messages
   if (path === "/v1/messages" && method === "POST") {
+    console.log(`\n[${new Date().toISOString()}] Incoming request: ${method} ${path}`);
     const body = await readBody(req);
+
+    // Parse and log the model being requested
+    try {
+      const parsed = JSON.parse(body);
+      console.log(`  Requested model: ${parsed.model || "not specified"}`);
+    } catch {
+      console.log("  Could not parse request body");
+    }
+
     const headers: Record<string, string> = {};
     for (const [key, value] of Object.entries(req.headers)) {
       if (typeof value === "string") {
@@ -51,6 +90,7 @@ async function handleRequest(
       { logRequest }
     );
 
+    console.log(`  Response status: ${response.status}`);
     res.writeHead(response.status, response.headers);
     res.end(response.body);
     return;
