@@ -26,3 +26,41 @@ export function resolveModel(model: string, config: Config): ResolvedProvider {
     model: modelName
   };
 }
+
+export async function forwardRequest(
+  request: { method: string; path: string; headers: Record<string, string>; body: string },
+  resolved: ResolvedProvider
+): Promise<{ status: number; headers: Record<string, string>; body: string }> {
+  const url = `${resolved.baseUrl}${request.path}`;
+
+  const headers: Record<string, string> = {
+    ...request.headers,
+    "content-type": "application/json"
+  };
+
+  // Add provider-specific auth header
+  if (resolved.type === "anthropic_messages") {
+    headers["x-api-key"] = resolved.apiKey;
+    headers["anthropic-version"] = "2023-06-01";
+  } else {
+    headers["authorization"] = `Bearer ${resolved.apiKey}`;
+  }
+
+  const response = await fetch(url, {
+    method: request.method,
+    headers,
+    body: request.method !== "GET" ? request.body : undefined
+  });
+
+  const responseBody = await response.text();
+  const responseHeaders: Record<string, string> = {};
+  response.headers.forEach((value, key) => {
+    responseHeaders[key] = value;
+  });
+
+  return {
+    status: response.status,
+    headers: responseHeaders,
+    body: responseBody
+  };
+}
