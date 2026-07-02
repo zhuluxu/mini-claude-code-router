@@ -34,6 +34,7 @@ function printStartupInfo(config: Config): void {
   for (const provider of config.providers) {
     console.log(`  - ${provider.name} (${provider.type})`);
     console.log(`    Base URL: ${provider.baseUrl}`);
+    console.log(`    API Key: ${provider.apiKey.substring(0, 3)}...`);
     console.log(`    Models: ${provider.models.join(", ")}`);
   }
 
