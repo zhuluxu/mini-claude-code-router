@@ -15,8 +15,18 @@ var VALID_PROVIDER_TYPES = [
 ];
 function loadConfig(path) {
   const content = readFileSync(path, "utf-8");
-  const raw = JSON.parse(content);
+  const expanded = expandEnvVars(content);
+  const raw = JSON.parse(expanded);
   return validateConfig(raw);
+}
+function expandEnvVars(content) {
+  return content.replace(/\$\{([^}]+)\}/g, (match, varName) => {
+    const value = process.env[varName];
+    if (value === void 0) {
+      throw new Error(`Environment variable ${varName} is not set`);
+    }
+    return value;
+  });
 }
 function validateConfig(raw) {
   if (typeof raw !== "object" || raw === null) {

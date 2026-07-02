@@ -10,8 +10,19 @@ const VALID_PROVIDER_TYPES: ProviderType[] = [
 
 export function loadConfig(path: string): Config {
   const content = readFileSync(path, "utf-8");
-  const raw = JSON.parse(content);
+  const expanded = expandEnvVars(content);
+  const raw = JSON.parse(expanded);
   return validateConfig(raw);
+}
+
+function expandEnvVars(content: string): string {
+  return content.replace(/\$\{([^}]+)\}/g, (match, varName) => {
+    const value = process.env[varName];
+    if (value === undefined) {
+      throw new Error(`Environment variable ${varName} is not set`);
+    }
+    return value;
+  });
 }
 
 export function validateConfig(raw: unknown): Config {

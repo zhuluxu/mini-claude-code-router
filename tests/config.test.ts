@@ -72,4 +72,61 @@ describe("config", () => {
       logging: { enabled: true, level: "info" }
     })).toThrow(/invalid provider type/i);
   });
+
+  it("should expand environment variables", () => {
+    const configPath = join(tempDir, "config.json");
+    const configWithEnv = {
+      server: { host: "127.0.0.1", port: 3456 },
+      providers: [
+        {
+          name: "test",
+          type: "anthropic_messages",
+          baseUrl: "https://api.test.com",
+          apiKey: "${TEST_API_KEY}",
+          models: ["test-model"]
+        }
+      ],
+      router: {
+        defaultModel: "test/test-model",
+        fallback: []
+      },
+      logging: { enabled: true, level: "info" }
+    };
+
+    writeFileSync(configPath, JSON.stringify(configWithEnv, null, 2));
+
+    // Set environment variable
+    process.env.TEST_API_KEY = "secret-key-123";
+
+    const config = loadConfig(configPath);
+    expect(config.providers[0].apiKey).toBe("secret-key-123");
+
+    // Clean up
+    delete process.env.TEST_API_KEY;
+  });
+
+  it("should throw error for undefined environment variable", () => {
+    const configPath = join(tempDir, "config.json");
+    const configWithEnv = {
+      server: { host: "127.0.0.1", port: 3456 },
+      providers: [
+        {
+          name: "test",
+          type: "anthropic_messages",
+          baseUrl: "https://api.test.com",
+          apiKey: "${UNDEFINED_VAR}",
+          models: ["test-model"]
+        }
+      ],
+      router: {
+        defaultModel: "test/test-model",
+        fallback: []
+      },
+      logging: { enabled: true, level: "info" }
+    };
+
+    writeFileSync(configPath, JSON.stringify(configWithEnv, null, 2));
+
+    expect(() => loadConfig(configPath)).toThrow(/environment variable UNDEFINED_VAR is not set/i);
+  });
 });
