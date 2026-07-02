@@ -57,6 +57,9 @@ async function handleRequest(
   const path = url.pathname;
   const method = req.method || "GET";
 
+  // Log ALL incoming requests
+  console.log(`\n[${new Date().toISOString()}] Request: ${method} ${path}`);
+
   // Health check
   if (path === "/health" && method === "GET") {
     res.writeHead(200, { "content-type": "application/json" });
