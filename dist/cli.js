@@ -91,8 +91,8 @@ function validateProvider(raw) {
   if (typeof provider.apiKey !== "string") {
     throw new Error(`Provider ${provider.name} missing required field: apiKey`);
   }
-  if (!Array.isArray(provider.models) || provider.models.length === 0) {
-    throw new Error(`Provider ${provider.name} must have at least one model`);
+  if (typeof provider.model !== "string" || provider.model.length === 0) {
+    throw new Error(`Provider ${provider.name} missing required field: model`);
   }
 }
 
@@ -111,8 +111,8 @@ function resolveModel(model, config) {
   if (!provider) {
     throw new Error(`Unknown provider: ${providerName}`);
   }
-  if (!provider.models.includes(modelName)) {
-    throw new Error(`Model ${modelName} not found in provider ${providerName}`);
+  if (provider.model !== modelName) {
+    throw new Error(`Model ${modelName} not found in provider ${providerName}. Available: ${provider.model}`);
   }
   return {
     name: provider.name,
@@ -247,27 +247,75 @@ function formatLogEntry(entry) {
 // src/server.ts
 async function startServer(config) {
   initLogger(config.logging);
+  printStartupInfo(config);
   const server = createServer(async (req, res) => {
     await handleRequest(req, res, config);
   });
   return new Promise((resolve) => {
     server.listen(config.server.port, config.server.host, () => {
-      console.log(`Gateway listening on http://${config.server.host}:${config.server.port}`);
+      console.log(`
+Gateway listening on http://${config.server.host}:${config.server.port}`);
+      console.log("Ready to accept requests.\n");
       resolve(server);
     });
   });
+}
+function printStartupInfo(config) {
+  console.log("=".repeat(60));
+  console.log("Mini Claude Code Router - Starting");
+  console.log("=".repeat(60));
+  console.log(`
+Server: http://${config.server.host}:${config.server.port}`);
+  console.log(`Default Model: ${config.router.defaultModel}`);
+  console.log("\nProviders:");
+  for (const provider of config.providers) {
+    console.log(`  - ${provider.name} (${provider.type})`);
+    console.log(`    Base URL: ${provider.baseUrl}`);
+    console.log(`    API Key: ${provider.apiKey.substring(0, 3)}...`);
+    console.log(`    Model: ${provider.model}`);
+  }
+  if (config.router.fallback.length > 0) {
+    console.log("\nFallback Chain:");
+    config.router.fallback.forEach((model, i) => {
+      console.log(`  ${i + 1}. ${model}`);
+    });
+  }
+  console.log(`
+Logging: ${config.logging.enabled ? "enabled" : "disabled"} (${config.logging.level})`);
+  console.log("=".repeat(60));
 }
 async function handleRequest(req, res, config) {
   const url = new URL(req.url || "/", `http://${req.headers.host}`);
   const path = url.pathname;
   const method = req.method || "GET";
+  console.log(`
+[${(/* @__PURE__ */ new Date()).toISOString()}] Request: ${method} ${path}`);
   if (path === "/health" && method === "GET") {
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify({ status: "ok" }));
     return;
   }
+  if (path === "/v1/models" && method === "GET") {
+    const models = config.providers.map((provider) => ({
+      id: `${provider.name}/${provider.model}`,
+      object: "model",
+      created: Date.now(),
+      owned_by: provider.name
+    }));
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ object: "list", data: models }));
+    return;
+  }
   if (path === "/v1/messages" && method === "POST") {
+    console.log(`
+[${(/* @__PURE__ */ new Date()).toISOString()}] Incoming request: ${method} ${path}`);
     const body = await readBody(req);
+    try {
+      const parsed = JSON.parse(body);
+      console.log(`  Requested model: ${parsed.model || "not specified"}`);
+    } catch {
+      console.log("  Could not parse request body");
+    }
     const headers = {};
     for (const [key, value] of Object.entries(req.headers)) {
       if (typeof value === "string") {
@@ -279,6 +327,7 @@ async function handleRequest(req, res, config) {
       config,
       { logRequest }
     );
+    console.log(`  Response status: ${response.status}`);
     res.writeHead(response.status, response.headers);
     res.end(response.body);
     return;

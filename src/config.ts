@@ -106,7 +106,7 @@ function validateProvider(raw: unknown): void {
     throw new Error(`Provider ${provider.name} missing required field: apiKey`);
   }
 
-  if (!Array.isArray(provider.models) || provider.models.length === 0) {
-    throw new Error(`Provider ${provider.name} must have at least one model`);
+  if (typeof provider.model !== "string" || provider.model.length === 0) {
+    throw new Error(`Provider ${provider.name} missing required field: model`);
   }
 }

@@ -10,14 +10,14 @@ const mockConfig: Config = {
       type: "anthropic_messages",
       baseUrl: "https://api.anthropic.com",
       apiKey: "test-key",
-      models: ["claude-sonnet-4-20250514"]
+      model: "claude-sonnet-4-20250514"
     },
     {
       name: "openrouter",
       type: "openai_chat_completions",
       baseUrl: "https://openrouter.ai/api/v1",
       apiKey: "test-key",
-      models: ["anthropic/claude-sonnet-4"]
+      model: "anthropic/claude-sonnet-4"
     }
   ],
   router: {

@@ -26,7 +26,7 @@ describe("config", () => {
           type: "anthropic_messages",
           baseUrl: "https://api.test.com",
           apiKey: "test-key",
-          models: ["test-model"]
+          model: "test-model"
         }
       ],
       router: {
@@ -62,7 +62,7 @@ describe("config", () => {
       type: "invalid_type",
       baseUrl: "https://api.test.com",
       apiKey: "test-key",
-      models: ["test-model"]
+      model: "test-model"
     };
 
     expect(() => validateConfig({
@@ -83,7 +83,7 @@ describe("config", () => {
           type: "anthropic_messages",
           baseUrl: "https://api.test.com",
           apiKey: "${TEST_API_KEY}",
-          models: ["test-model"]
+          model: "test-model"
         }
       ],
       router: {
@@ -115,7 +115,7 @@ describe("config", () => {
           type: "anthropic_messages",
           baseUrl: "https://api.test.com",
           apiKey: "${UNDEFINED_VAR}",
-          models: ["test-model"]
+          model: "test-model"
         }
       ],
       router: {

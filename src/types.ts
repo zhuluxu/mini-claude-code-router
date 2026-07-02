@@ -9,7 +9,7 @@ export interface ProviderConfig {
   type: ProviderType;
   baseUrl: string;
   apiKey: string;
-  models: string[];
+  model: string;
 }
 
 export interface ServerConfig {

@@ -10,7 +10,7 @@ const mockConfig: Config = {
       type: "anthropic_messages",
       baseUrl: "https://api.test.com",
       apiKey: "test-key",
-      models: ["test-model"]
+      model: "test-model"
     }
   ],
   router: {

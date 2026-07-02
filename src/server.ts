@@ -35,7 +35,7 @@ function printStartupInfo(config: Config): void {
     console.log(`  - ${provider.name} (${provider.type})`);
     console.log(`    Base URL: ${provider.baseUrl}`);
     console.log(`    API Key: ${provider.apiKey.substring(0, 3)}...`);
-    console.log(`    Models: ${provider.models.join(", ")}`);
+    console.log(`    Model: ${provider.model}`);
   }
 
   if (config.router.fallback.length > 0) {
@@ -70,14 +70,12 @@ async function handleRequest(
 
   // Models list endpoint
   if (path === "/v1/models" && method === "GET") {
-    const models = config.providers.flatMap((provider) =>
-      provider.models.map((model) => ({
-        id: `${provider.name}/${model}`,
-        object: "model",
-        created: Date.now(),
-        owned_by: provider.name
-      }))
-    );
+    const models = config.providers.map((provider) => ({
+      id: `${provider.name}/${provider.model}`,
+      object: "model",
+      created: Date.now(),
+      owned_by: provider.name
+    }));
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify({ object: "list", data: models }));
     return;

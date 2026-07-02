@@ -14,8 +14,8 @@ export function resolveModel(model: string, config: Config): ResolvedProvider {
     throw new Error(`Unknown provider: ${providerName}`);
   }
 
-  if (!provider.models.includes(modelName)) {
-    throw new Error(`Model ${modelName} not found in provider ${providerName}`);
+  if (provider.model !== modelName) {
+    throw new Error(`Model ${modelName} not found in provider ${providerName}. Available: ${provider.model}`);
   }
 
   return {
