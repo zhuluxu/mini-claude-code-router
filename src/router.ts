@@ -64,3 +64,83 @@ export async function forwardRequest(
     body: responseBody
   };
 }
+
+export async function executeWithFallback(
+  request: { method: string; path: string; headers: Record<string, string>; body: string },
+  config: Config,
+  logger: { logRequest: (entry: any) => void }
+): Promise<{ status: number; headers: Record<string, string>; body: string }> {
+  const startTime = Date.now();
+  const model = extractModelFromBody(request.body);
+  const resolved = resolveModel(model, config);
+
+  // Build attempt chain: [primary, ...fallback]
+  const attempts: string[] = [
+    `${resolved.name}/${resolved.model}`,
+    ...config.router.fallback
+  ];
+
+  const errors: Array<{ provider: string; status: number; error: string }> = [];
+
+  for (const attempt of attempts) {
+    try {
+      const attemptResolved = resolveModel(attempt, config);
+      const response = await forwardRequest(request, attemptResolved);
+
+      // Success
+      logger.logRequest({
+        timestamp: new Date().toISOString(),
+        method: request.method,
+        path: request.path,
+        model: attempt,
+        provider: attemptResolved.name,
+        statusCode: response.status,
+        durationMs: Date.now() - startTime
+      });
+
+      return response;
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      errors.push({
+        provider: attempt,
+        status: 0,
+        error: errorMessage
+      });
+    }
+  }
+
+  // All attempts failed
+  const errorResponse = {
+    error: {
+      type: "gateway_error",
+      message: "All providers failed",
+      details: { attempts: errors }
+    }
+  };
+
+  logger.logRequest({
+    timestamp: new Date().toISOString(),
+    method: request.method,
+    path: request.path,
+    model,
+    provider: "all",
+    statusCode: 502,
+    durationMs: Date.now() - startTime,
+    error: "All providers failed"
+  });
+
+  return {
+    status: 502,
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(errorResponse)
+  };
+}
+
+function extractModelFromBody(body: string): string {
+  try {
+    const parsed = JSON.parse(body);
+    return parsed.model || "";
+  } catch {
+    return "";
+  }
+}
