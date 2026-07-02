@@ -578,51 +578,94 @@ git commit -m "feat: add model resolution logic"
 
 ---
 
-## 任务 5：Router 模块 - 单 Provider 转发
+## 任务 5：Router 模块 - 集成协议转换网关
 
 **文件：**
 - 修改：`src/router.ts`
 
-- [ ] **步骤 1：添加单 Provider 转发功能到 src/router.ts**
+- [ ] **步骤 1：集成 @the-next-ai/ai-gateway 到 src/router.ts**
 
-在文件末尾添加：
+替换整个 router.ts 文件内容：
 
 ```typescript
+import type { Config, ResolvedProvider } from "./types.js";
+import { createGatewayRuntime, type GatewayRuntime } from "@the-next-ai/ai-gateway";
+
+let gatewayRuntime: GatewayRuntime | undefined;
+
+export function resolveModel(model: string, config: Config): ResolvedProvider {
+  const modelSelector = model || config.router.defaultModel;
+  const [providerName, ...modelNameParts] = modelSelector.split("/");
+  const modelName = modelNameParts.join("/");
+
+  if (!providerName || !modelName) {
+    throw new Error(`Invalid model selector: ${modelSelector}. Expected format: provider/model`);
+  }
+
+  const provider = config.providers.find((p) => p.name === providerName);
+  if (!provider) {
+    throw new Error(`Unknown provider: ${providerName}`);
+  }
+
+  if (!provider.models.includes(modelName)) {
+    throw new Error(`Model ${modelName} not found in provider ${providerName}`);
+  }
+
+  return {
+    name: provider.name,
+    type: provider.type,
+    baseUrl: provider.baseUrl,
+    apiKey: provider.apiKey,
+    model: modelName
+  };
+}
+
+export function initGateway(config: Config): void {
+  // Convert our config to gateway config format
+  const gatewayConfig = {
+    host: config.server.host,
+    port: 0, // We'll use our own server port
+    auth: {
+      enabled: false
+    },
+    providers: config.providers.map((p) => ({
+      name: p.name,
+      type: p.type,
+      baseurl: p.baseUrl,
+      apikey: p.apiKey,
+      models: p.models
+    })),
+    bodyLimitBytes: 50 * 1024 * 1024
+  };
+
+  gatewayRuntime = createGatewayRuntime(gatewayConfig);
+}
+
 export async function forwardRequest(
   request: { method: string; path: string; headers: Record<string, string>; body: string },
   resolved: ResolvedProvider
 ): Promise<{ status: number; headers: Record<string, string>; body: string }> {
-  const url = `${resolved.baseUrl}${request.path}`;
-
-  const headers: Record<string, string> = {
-    ...request.headers,
-    "content-type": "application/json"
-  };
-
-  // Add provider-specific auth header
-  if (resolved.type === "anthropic_messages") {
-    headers["x-api-key"] = resolved.apiKey;
-    headers["anthropic-version"] = "2023-06-01";
-  } else {
-    headers["authorization"] = `Bearer ${resolved.apiKey}`;
+  if (!gatewayRuntime) {
+    throw new Error("Gateway not initialized. Call initGateway() first.");
   }
 
-  const response = await fetch(url, {
+  // Use the gateway runtime to handle the request with protocol conversion
+  // The gateway will automatically convert between protocols
+  const response = await gatewayRuntime.handleRequest({
     method: request.method,
-    headers,
-    body: request.method !== "GET" ? request.body : undefined
-  });
-
-  const responseBody = await response.text();
-  const responseHeaders: Record<string, string> = {};
-  response.headers.forEach((value, key) => {
-    responseHeaders[key] = value;
+    url: request.path,
+    headers: {
+      ...request.headers,
+      "x-target-provider": resolved.name,
+      "content-type": "application/json"
+    },
+    body: request.body
   });
 
   return {
     status: response.status,
-    headers: responseHeaders,
-    body: responseBody
+    headers: Object.fromEntries(response.headers.entries()),
+    body: await response.text()
   };
 }
 ```
@@ -631,7 +674,7 @@ export async function forwardRequest(
 
 ```bash
 git add src/router.ts
-git commit -m "feat: add single provider request forwarding"
+git commit -m "feat: integrate @the-next-ai/ai-gateway for protocol conversion"
 ```
 
 ---
@@ -818,11 +861,12 @@ npm test -- tests/server.test.ts
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import type { Server as HttpServer } from "node:http";
 import type { Config } from "./types.js";
-import { executeWithFallback } from "./router.js";
+import { executeWithFallback, initGateway } from "./router.js";
 import { logRequest, initLogger } from "./logger.js";
 
 export async function startServer(config: Config): Promise<HttpServer> {
   initLogger(config.logging);
+  initGateway(config); // Initialize the protocol conversion gateway
 
   const server = createServer(async (req, res) => {
     await handleRequest(req, res, config);
