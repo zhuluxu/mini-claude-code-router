@@ -68,6 +68,16 @@ export function validateConfig(raw: unknown): Config {
     throw new Error("Missing required field: router.fallback");
   }
 
+  // Validate rules (optional)
+  if (router.rules !== undefined) {
+    if (!Array.isArray(router.rules)) {
+      throw new Error("router.rules must be an array");
+    }
+    for (let i = 0; i < router.rules.length; i++) {
+      validateRouterRule(router.rules[i], i);
+    }
+  }
+
   // Validate logging
   if (!config.logging || typeof config.logging !== "object") {
     throw new Error("Missing required field: logging");
@@ -108,5 +118,43 @@ function validateProvider(raw: unknown): void {
 
   if (typeof provider.model !== "string" || provider.model.length === 0) {
     throw new Error(`Provider ${provider.name} missing required field: model`);
+  }
+}
+
+function validateRouterRule(raw: unknown, index: number): void {
+  if (typeof raw !== "object" || raw === null) {
+    throw new Error(`router.rules[${index}] must be an object`);
+  }
+
+  const rule = raw as Record<string, unknown>;
+
+  // Validate when
+  if (typeof rule.when !== "object" || rule.when === null) {
+    throw new Error(`router.rules[${index}] missing required field: when (object)`);
+  }
+  const when = rule.when as Record<string, unknown>;
+
+  if (when.thinking !== undefined && typeof when.thinking !== "boolean") {
+    throw new Error(`router.rules[${index}].when.thinking must be a boolean`);
+  }
+  if (when.tools !== undefined && typeof when.tools !== "boolean") {
+    throw new Error(`router.rules[${index}].when.tools must be a boolean`);
+  }
+  if (when.messagesGte !== undefined && typeof when.messagesGte !== "number") {
+    throw new Error(`router.rules[${index}].when.messagesGte must be a number`);
+  }
+  if (when.messagesLt !== undefined && typeof when.messagesLt !== "number") {
+    throw new Error(`router.rules[${index}].when.messagesLt must be a number`);
+  }
+
+  // Must have at least one condition
+  const conditionKeys = ["thinking", "tools", "messagesGte", "messagesLt"];
+  if (!conditionKeys.some((k) => when[k] !== undefined)) {
+    throw new Error(`router.rules[${index}].when must have at least one condition`);
+  }
+
+  // Validate target
+  if (typeof rule.target !== "string" || rule.target.length === 0) {
+    throw new Error(`router.rules[${index}] missing required field: target (non-empty string)`);
   }
 }

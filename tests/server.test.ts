@@ -1,9 +1,9 @@
-import { describe, it, expect, afterAll } from "vitest";
+import { describe, it, expect, afterAll, beforeEach, afterEach } from "vitest";
 import { startServer } from "../src/server.js";
 import type { Config } from "../src/types.js";
 
 const mockConfig: Config = {
-  server: { host: "127.0.0.1", port: 0 }, // port 0 = random port
+  server: { host: "127.0.0.1", port: 0 },
   providers: [
     {
       name: "test",

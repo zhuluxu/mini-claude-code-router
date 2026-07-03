@@ -64,14 +64,21 @@ export function logError(error: Error): void {
 }
 
 function formatLogEntry(entry: LogEntry): string {
-  const parts = [
+  const parts: string[] = [
     `[${entry.timestamp}]`,
-    `${entry.method} ${entry.path}`,
+    `${entry.method} ${entry.path}`
+  ];
+
+  if (entry.requestedModel && entry.requestedModel !== entry.model) {
+    parts.push(`requested=${entry.requestedModel}`);
+  }
+
+  parts.push(
     `model=${entry.model}`,
     `provider=${entry.provider}`,
     `status=${entry.statusCode}`,
     `duration=${entry.durationMs}ms`
-  ];
+  );
 
   // Add token usage if available
   if (entry.usage) {

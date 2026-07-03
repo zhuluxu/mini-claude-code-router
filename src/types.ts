@@ -17,9 +17,22 @@ export interface ServerConfig {
   port: number;
 }
 
+export interface RouterRuleCondition {
+  thinking?: boolean;
+  tools?: boolean;
+  messagesGte?: number;
+  messagesLt?: number;
+}
+
+export interface RouterRule {
+  when: RouterRuleCondition;
+  target: string;
+}
+
 export interface RouterConfig {
   defaultModel: string;
   fallback: string[];
+  rules?: RouterRule[];
 }
 
 export interface LoggingConfig {
@@ -47,6 +60,7 @@ export interface LogEntry {
   timestamp: string;
   method: string;
   path: string;
+  requestedModel?: string;
   model: string;
   provider: string;
   statusCode: number;

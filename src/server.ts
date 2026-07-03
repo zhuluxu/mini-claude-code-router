@@ -1,13 +1,15 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import type { Server as HttpServer } from "node:http";
+import { Readable, Transform } from "node:stream";
 import type { Config } from "./types.js";
-import { executeWithFallback } from "./router.js";
+import { executeWithFallback, type ForwardResult } from "./router.js";
 import { logRequest, initLogger } from "./logger.js";
+import { OpenAIToAnthropicSseTransformer, parseSseChunk } from "./transform.js";
+import { AnthropicSseUsageExtractor } from "./sse-usage.js";
 
 export async function startServer(config: Config): Promise<HttpServer> {
   initLogger(config.logging);
 
-  // Print startup information
   printStartupInfo(config);
 
   const server = createServer(async (req, res) => {
@@ -58,7 +60,6 @@ async function handleRequest(
   const path = url.pathname;
   const method = req.method || "GET";
 
-  // Log ALL incoming requests
   console.log(`\n[${new Date().toISOString()}] Request: ${method} ${path}`);
 
   // Health check
@@ -83,13 +84,12 @@ async function handleRequest(
 
   // Core endpoint: POST /v1/messages
   if (path === "/v1/messages" && method === "POST") {
-    console.log(`\n[${new Date().toISOString()}] Incoming request: ${method} ${path}`);
     const body = await readBody(req);
 
-    // Parse and log the model being requested
     try {
       const parsed = JSON.parse(body);
       console.log(`  Requested model: ${parsed.model || "not specified"}`);
+      if (parsed.stream) console.log(`  Stream: ${parsed.stream}`);
     } catch {
       console.log("  Could not parse request body");
     }
@@ -101,21 +101,127 @@ async function handleRequest(
       }
     }
 
-    const response = await executeWithFallback(
+    const result = await executeWithFallback(
       { method, path, headers, body },
       config,
       { logRequest }
     );
 
-    console.log(`  Response status: ${response.status}`);
-    res.writeHead(response.status, response.headers);
-    res.end(response.body);
+    await writeResultToResponse(result, res, logRequest);
     return;
   }
 
   // 404 for other routes
   res.writeHead(404, { "content-type": "application/json" });
   res.end(JSON.stringify({ error: { message: "Not found" } }));
+}
+
+async function writeResultToResponse(
+  result: ForwardResult,
+  res: ServerResponse,
+  logRequestFn: (entry: any) => void
+): Promise<void> {
+  if (result.isStreaming && result.responseStream) {
+    // Streaming: pipe directly to client
+    res.writeHead(result.status, result.headers);
+
+    const nodeStream = Readable.fromWeb(
+      result.responseStream as unknown as import("node:stream/web").ReadableStream
+    );
+
+    let transformer: OpenAIToAnthropicSseTransformer | null = null;
+    let usageExtractor: AnthropicSseUsageExtractor | null = null;
+
+    if (result.needsSseTransform && result.transformModel) {
+      // Cross-protocol: pipe through SSE transformer (which also tracks usage)
+      transformer = new OpenAIToAnthropicSseTransformer(result.transformModel);
+      const transformStream = createSseTransformStream(transformer);
+      nodeStream.pipe(transformStream).pipe(res);
+    } else {
+      // Same protocol: transparent passthrough with usage extraction
+      usageExtractor = new AnthropicSseUsageExtractor();
+      const usageStream = createUsagePassthroughStream(usageExtractor);
+      nodeStream.pipe(usageStream).pipe(res);
+    }
+
+    // Log after stream ends (with extracted usage) or on error
+    const finishLogging = (error?: string) => {
+      if (!result.logContext) return;
+      let usage = result.usage;
+      if (transformer) {
+        const tUsage = transformer.getUsage();
+        usage = { inputTokens: tUsage.inputTokens, outputTokens: tUsage.outputTokens };
+      } else if (usageExtractor) {
+        usageExtractor.finish();
+        usage = usageExtractor.getUsage();
+      }
+      logRequestFn({
+        ...result.logContext,
+        usage: usage || undefined,
+        error
+      });
+    };
+
+    nodeStream.on("end", () => finishLogging());
+    nodeStream.on("error", (err) => finishLogging(err.message));
+    res.on("close", () => {
+      if (!res.writableEnded) {
+        finishLogging("client disconnected");
+      }
+    });
+    return;
+  }
+
+  // Non-streaming: write buffered body
+  res.writeHead(result.status, result.headers);
+  res.end(result.body);
+}
+
+function createSseTransformStream(transformer: OpenAIToAnthropicSseTransformer): Transform {
+  let carry = "";
+
+  return new Transform({
+    transform(chunk: Buffer, _encoding, callback) {
+      const text = chunk.toString("utf8");
+      const { lines, remainder } = parseSseChunk(text, carry);
+      carry = remainder;
+
+      for (const line of lines) {
+        const events = transformer.transformDataLine(line);
+        for (const event of events) {
+          this.push(event);
+        }
+      }
+      callback();
+    },
+    flush(callback) {
+      if (carry.trim()) {
+        const { lines } = parseSseChunk("\n", carry);
+        for (const line of lines) {
+          const events = transformer.transformDataLine(line);
+          for (const event of events) {
+            this.push(event);
+          }
+        }
+      }
+      callback();
+    }
+  });
+}
+
+function createUsagePassthroughStream(extractor: AnthropicSseUsageExtractor): Transform {
+  return new Transform({
+    transform(chunk: Buffer, _encoding, callback) {
+      // Feed to extractor for usage parsing, then pass chunk through unchanged
+      extractor.processChunk(chunk.toString("utf8"));
+      this.push(chunk);
+      callback();
+    },
+    flush(callback) {
+      extractor.finish();
+      callback();
+    }
+  });
 }
 
 function readBody(req: IncomingMessage): Promise<string> {

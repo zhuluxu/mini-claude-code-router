@@ -1,33 +1,112 @@
-import type { Config, ResolvedProvider } from "./types.js";
+import type { Config, ResolvedProvider, RouterRule, RouterRuleCondition } from "./types.js";
+import {
+  transformRequestToOpenAI,
+  transformResponseFromOpenAI
+} from "./transform.js";
 
-export function resolveModel(model: string, config: Config): ResolvedProvider {
-  // Gateway ignores the requested model name, always uses configured provider/model
-  const [providerName, ...modelNameParts] = config.router.defaultModel.split("/");
-  const modelName = modelNameParts.join("/");
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
 
-  if (!providerName || !modelName) {
-    throw new Error(`Invalid default model in config: ${config.router.defaultModel}. Expected format: provider/model`);
+export interface ForwardResult {
+  status: number;
+  headers: Record<string, string>;
+  body?: string;
+  responseStream?: ReadableStream<Uint8Array>;
+  isStreaming: boolean;
+  needsSseTransform: boolean;
+  transformModel?: string;
+  usage?: any;
+  // Context for deferred logging (streaming responses log after pipe completes)
+  logContext?: {
+    timestamp: string;
+    method: string;
+    path: string;
+    requestedModel?: string;
+    model: string;
+    provider: string;
+    durationMs: number;
+    statusCode: number;
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Model resolution
+// ---------------------------------------------------------------------------
+
+export function resolveModel(selector: string, config: Config): ResolvedProvider {
+  if (!selector) {
+    return resolveModel(config.router.defaultModel, config);
   }
+
+  const slashIndex = selector.indexOf("/");
+  if (slashIndex === -1) {
+    // Bare model name (no provider prefix): find a provider that serves it
+    const provider = config.providers.find((p) => p.model === selector);
+    if (provider) {
+      return { ...provider };
+    }
+    console.warn(
+      `[router] Model "${selector}" not found in any provider, falling back to default "${config.router.defaultModel}"`
+    );
+    return resolveModel(config.router.defaultModel, config);
+  }
+
+  const providerName = selector.slice(0, slashIndex);
+  const modelName = selector.slice(slashIndex + 1);
 
   const provider = config.providers.find((p) => p.name === providerName);
   if (!provider) {
-    throw new Error(`Default provider ${providerName} not found in config`);
+    console.warn(
+      `[router] Provider "${providerName}" not found for selector "${selector}", falling back to default "${config.router.defaultModel}"`
+    );
+    return resolveModel(config.router.defaultModel, config);
+  }
+  if (provider.model !== modelName) {
+    console.warn(
+      `[router] Model "${modelName}" not found in provider "${providerName}" (available: ${provider.model}), falling back to default "${config.router.defaultModel}"`
+    );
+    return resolveModel(config.router.defaultModel, config);
   }
 
-  return {
-    name: provider.name,
-    type: provider.type,
-    baseUrl: provider.baseUrl,
-    apiKey: provider.apiKey,
-    model: provider.model
-  };
+  return { ...provider };
 }
+
+// Check if a model selector resolves to a configured provider/model.
+// Used to decide whether to apply rule-based routing for unknown models.
+function modelExists(selector: string, config: Config): boolean {
+  if (!selector) return false;
+  const slashIndex = selector.indexOf("/");
+  if (slashIndex === -1) {
+    return config.providers.some((p) => p.model === selector);
+  }
+  const providerName = selector.slice(0, slashIndex);
+  const modelName = selector.slice(slashIndex + 1);
+  const provider = config.providers.find((p) => p.name === providerName);
+  return !!provider && provider.model === modelName;
+}
+
+// ---------------------------------------------------------------------------
+// Fallback decision
+// ---------------------------------------------------------------------------
+
+function shouldFallbackAfterStatus(statusCode: number): boolean {
+  return statusCode === 408 || statusCode === 409 || statusCode === 429 || statusCode >= 500;
+}
+
+// ---------------------------------------------------------------------------
+// Request forwarding
+// ---------------------------------------------------------------------------
 
 export async function forwardRequest(
   request: { method: string; path: string; headers: Record<string, string>; body: string },
   resolved: ResolvedProvider
-): Promise<{ status: number; headers: Record<string, string>; body: string; usage?: any }> {
-  // Map provider type to correct endpoint path
+): Promise<ForwardResult> {
+  const isCrossProtocol =
+    resolved.type === "openai_chat_completions" || resolved.type === "openai_responses";
+  const isAnthropicProtocol = resolved.type === "anthropic_messages";
+
+  // Build target URL
   let targetPath = request.path;
   if (resolved.type === "openai_chat_completions") {
     targetPath = "/v1/chat/completions";
@@ -35,227 +114,298 @@ export async function forwardRequest(
     targetPath = "/v1/responses";
   } else if (resolved.type === "anthropic_messages") {
     targetPath = "/v1/messages";
-  } else if (resolved.type === "gemini_generate_content") {
-    // Gemini uses the original path structure
-    targetPath = request.path;
   }
 
   const url = `${resolved.baseUrl}${targetPath}`;
 
-  console.log(`  Forwarding to: ${url}`);
-  console.log(`  Provider: ${resolved.name} (${resolved.type})`);
-  console.log(`  API Key: ${resolved.apiKey.substring(0, 10)}...`);
-
-  // Replace model name and transform request body based on provider type
+  // Prepare body
   let bodyToSend = request.body;
+  let isStreamingRequest = false;
+
   if (request.body) {
     try {
       const parsed = JSON.parse(request.body);
-      if (parsed.model) {
-        console.log(`  Replacing model: ${parsed.model} -> ${resolved.model}`);
+      isStreamingRequest = parsed.stream === true;
+
+      if (isCrossProtocol) {
+        const transformed = transformRequestToOpenAI(parsed);
+        transformed.model = resolved.model;
+        bodyToSend = JSON.stringify(transformed);
+      } else {
+        // Same protocol (anthropic_messages, gemini): only replace model, preserve everything
         parsed.model = resolved.model;
+        bodyToSend = JSON.stringify(parsed);
       }
-
-      // Transform Anthropic format to OpenAI format
-      if (resolved.type === "openai_chat_completions" || resolved.type === "openai_responses") {
-        // Move system message to messages array if present
-        if (parsed.system) {
-          const systemContent = typeof parsed.system === "string"
-            ? parsed.system
-            : Array.isArray(parsed.system)
-              ? parsed.system.map((s: any) => s.text || s).join("\n")
-              : "";
-          if (systemContent) {
-            parsed.messages = [
-              { role: "system", content: systemContent },
-              ...(parsed.messages || [])
-            ];
-          }
-          delete parsed.system;
-        }
-
-        // Convert Anthropic message format to OpenAI format
-        if (parsed.messages) {
-          parsed.messages = parsed.messages.map((msg: any) => {
-            // Handle content as array (Anthropic multimodal)
-            if (Array.isArray(msg.content)) {
-              const textParts = msg.content
-                .filter((part: any) => part.type === "text")
-                .map((part: any) => part.text)
-                .join("\n");
-              return { role: msg.role, content: textParts };
-            }
-            return msg;
-          });
-        }
-
-        // Convert tools from Anthropic format to OpenAI format
-        if (parsed.tools && Array.isArray(parsed.tools)) {
-          parsed.tools = parsed.tools.map((tool: any) => {
-            if (tool.input_schema) {
-              return {
-                type: "function",
-                function: {
-                  name: tool.name,
-                  description: tool.description || "",
-                  parameters: tool.input_schema
-                }
-              };
-            }
-            return tool;
-          });
-          console.log(`  Transformed: converted ${parsed.tools.length} tools to OpenAI format`);
-        }
-
-        // Map max_tokens to max_completion_tokens for newer OpenAI models
-        if (parsed.max_tokens && !parsed.max_completion_tokens) {
-          parsed.max_completion_tokens = parsed.max_tokens;
-        }
-
-        // Remove Anthropic-specific fields that OpenAI doesn't support
-        delete parsed.thinking;
-        delete parsed.context_management;
-        delete parsed.output_config;
-        delete parsed.metadata;
-        delete parsed.stream; // We'll handle streaming separately
-        console.log(`  Transformed: removed Anthropic-specific fields`);
-      }
-
-      bodyToSend = JSON.stringify(parsed);
-      console.log(`  Transformed body (first 500 chars): ${bodyToSend.substring(0, 500)}`);
-      console.log(`  Transformed body length: ${bodyToSend.length} bytes`);
-      console.log(`  Request fields: ${Object.keys(parsed).join(", ")}`);
-      if (parsed.stream) console.log(`  Stream: ${parsed.stream}`);
-      if (parsed.temperature) console.log(`  Temperature: ${parsed.temperature}`);
-      if (parsed.top_p) console.log(`  Top_p: ${parsed.top_p}`);
-      if (parsed.tools) console.log(`  Tools count: ${parsed.tools.length}`);
-      if (parsed.messages) console.log(`  Messages count: ${parsed.messages.length}`);
     } catch {
-      // If body is not JSON, use as-is
+      // Not JSON, forward as-is
     }
   }
 
-  const headers: Record<string, string> = {
-    ...request.headers,
-    "content-type": "application/json"
-  };
+  // Build headers
+  const headers: Record<string, string> = {};
 
-  // Remove incoming auth headers since we'll add our own
-  delete headers["x-api-key"];
-  delete headers["authorization"];
-  delete headers["anthropic-version"];
-  // Remove content-length as we'll set it based on the actual body
-  delete headers["content-length"];
-
-  // Add provider-specific auth header
-  if (resolved.type === "anthropic_messages") {
+  if (isAnthropicProtocol) {
+    // Transparent passthrough: preserve all client headers except auth & content-length
+    for (const [key, value] of Object.entries(request.headers)) {
+      const lower = key.toLowerCase();
+      if (lower === "x-api-key" || lower === "authorization") continue;
+      if (lower === "content-length") continue;
+      if (lower === "host") continue;
+      headers[key] = value;
+    }
+    // Set our auth
     headers["x-api-key"] = resolved.apiKey;
-    headers["anthropic-version"] = "2023-06-01";
-    console.log(`  Auth: x-api-key`);
-  } else {
+    // Only set anthropic-version if client didn't provide one
+    if (!headers["anthropic-version"]) {
+      headers["anthropic-version"] = "2023-06-01";
+    }
+  } else if (isCrossProtocol) {
+    // Strip Anthropic headers, add OpenAI auth
+    headers["content-type"] = "application/json";
     headers["authorization"] = `Bearer ${resolved.apiKey}`;
-    console.log(`  Auth: Bearer token`);
+    const accept = request.headers["accept"];
+    if (accept) headers["accept"] = accept;
+  } else {
+    // Gemini or other: forward headers, replace auth
+    for (const [key, value] of Object.entries(request.headers)) {
+      const lower = key.toLowerCase();
+      if (lower === "x-api-key" || lower === "authorization" || lower === "content-length" || lower === "host") continue;
+      headers[key] = value;
+    }
+    headers["x-api-key"] = resolved.apiKey;
   }
 
-  // Set correct content-length for the modified body
+  // Set content-length for modified body
   if (request.method !== "GET" && bodyToSend) {
     headers["content-length"] = String(Buffer.byteLength(bodyToSend, "utf8"));
   }
 
-  let response;
-  try {
-    response = await fetch(url, {
-      method: request.method,
-      headers,
-      body: request.method !== "GET" ? bodyToSend : undefined
-    });
-  } catch (error) {
-    console.error(`  Fetch error type: ${error?.constructor?.name}`);
-    console.error(`  Fetch error message: ${error?.message}`);
-    if (error?.cause) {
-      console.error(`  Fetch error cause: ${JSON.stringify(error.cause, null, 2)}`);
-    }
-    console.error(`  Full error: ${JSON.stringify(error, Object.getOwnPropertyNames(error), 2)}`);
-    throw error;
-  }
+  const response = await fetch(url, {
+    method: request.method,
+    headers,
+    body: request.method !== "GET" ? bodyToSend : undefined
+  });
 
-  const responseBody = await response.text();
+  // Build response headers (skip encoding/length — we'll set our own)
   const responseHeaders: Record<string, string> = {};
   response.headers.forEach((value, key) => {
+    const lower = key.toLowerCase();
+    if (lower === "content-encoding" || lower === "transfer-encoding" || lower === "content-length") return;
     responseHeaders[key] = value;
   });
 
-  // Parse usage from response body
-  let usage: any = undefined;
-  try {
-    const parsed = JSON.parse(responseBody);
-    if (parsed.usage) {
-      usage = {
-        inputTokens: parsed.usage.input_tokens || parsed.usage.prompt_tokens,
-        outputTokens: parsed.usage.output_tokens || parsed.usage.completion_tokens,
-        cacheCreationInputTokens: parsed.usage.cache_creation_input_tokens,
-        cacheReadInputTokens: parsed.usage.cache_read_input_tokens
-      };
+  // Determine if response is streaming
+  const contentType = response.headers.get("content-type") || "";
+  const isStreaming =
+    contentType.includes("text/event-stream") || (isStreamingRequest && response.status === 200);
+
+  const needsSseTransform = isStreaming && isCrossProtocol;
+
+  if (isStreaming && response.body) {
+    // For cross-protocol, set content-type to Anthropic SSE format
+    if (isCrossProtocol) {
+      responseHeaders["content-type"] = "text/event-stream; charset=utf-8";
     }
-  } catch {
-    // Response is not JSON or doesn't have usage info
+    return {
+      status: response.status,
+      headers: responseHeaders,
+      responseStream: response.body,
+      isStreaming: true,
+      needsSseTransform,
+      transformModel: resolved.model
+    };
   }
 
-  if (response.status !== 200) {
-    console.log(`  Response status: ${response.status}`);
-    console.log(`  Response body: ${responseBody.substring(0, 500)}`);
+  // Non-streaming: buffer the response
+  const responseBody = await response.text();
+  let finalBody = responseBody;
+  let usage: any;
+
+  if (isCrossProtocol) {
+    try {
+      const parsed = JSON.parse(responseBody);
+      if (parsed.choices && Array.isArray(parsed.choices)) {
+        const anthropicResponse = transformResponseFromOpenAI(parsed, resolved.model);
+        finalBody = JSON.stringify(anthropicResponse);
+        usage = {
+          inputTokens: anthropicResponse.usage.input_tokens,
+          outputTokens: anthropicResponse.usage.output_tokens
+        };
+      }
+    } catch {
+      // Conversion failed, use original body
+    }
+  } else {
+    try {
+      const parsed = JSON.parse(responseBody);
+      if (parsed.usage) {
+        usage = {
+          inputTokens: parsed.usage.input_tokens || parsed.usage.prompt_tokens,
+          outputTokens: parsed.usage.output_tokens || parsed.usage.completion_tokens,
+          cacheCreationInputTokens: parsed.usage.cache_creation_input_tokens,
+          cacheReadInputTokens: parsed.usage.cache_read_input_tokens
+        };
+      }
+    } catch {
+      // Not JSON or no usage
+    }
   }
+
+  responseHeaders["content-length"] = String(Buffer.byteLength(finalBody, "utf8"));
 
   return {
     status: response.status,
     headers: responseHeaders,
-    body: responseBody,
+    body: finalBody,
+    isStreaming: false,
+    needsSseTransform: false,
+    transformModel: resolved.model,
     usage
   };
 }
+
+// ---------------------------------------------------------------------------
+// Rule-based routing
+// ---------------------------------------------------------------------------
+
+// Evaluate router rules against the parsed request body.
+// Returns the matched rule (with index and target) if a rule matches, or undefined if none match.
+export function evaluateRules(
+  parsedBody: any,
+  defaultModel: string,
+  rules: RouterRule[] | undefined
+): { index: number; target: string; condition: RouterRuleCondition } | undefined {
+  if (!rules || rules.length === 0) return undefined;
+
+  const hasThinking = parsedBody?.thinking !== undefined && parsedBody?.thinking !== null;
+  const hasTools = Array.isArray(parsedBody?.tools) && parsedBody.tools.length > 0;
+  const messageCount = Array.isArray(parsedBody?.messages) ? parsedBody.messages.length : 0;
+
+  for (let i = 0; i < rules.length; i++) {
+    const rule = rules[i];
+    const cond = rule.when;
+    if (matchesCondition(cond, hasThinking, hasTools, messageCount)) {
+      return { index: i, target: rule.target, condition: cond };
+    }
+  }
+
+  return undefined;
+}
+
+function matchesCondition(
+  cond: RouterRuleCondition,
+  hasThinking: boolean,
+  hasTools: boolean,
+  messageCount: number
+): boolean {
+  if (cond.thinking !== undefined && cond.thinking !== hasThinking) return false;
+  if (cond.tools !== undefined && cond.tools !== hasTools) return false;
+  if (cond.messagesGte !== undefined && messageCount < cond.messagesGte) return false;
+  if (cond.messagesLt !== undefined && messageCount >= cond.messagesLt) return false;
+  return true;
+}
+
+function formatCondition(cond: RouterRuleCondition): string {
+  const parts: string[] = [];
+  if (cond.thinking !== undefined) parts.push(`thinking=${cond.thinking}`);
+  if (cond.tools !== undefined) parts.push(`tools=${cond.tools}`);
+  if (cond.messagesGte !== undefined) parts.push(`messages>=${cond.messagesGte}`);
+  if (cond.messagesLt !== undefined) parts.push(`messages<${cond.messagesLt}`);
+  return parts.join(", ");
+}
+
+// ---------------------------------------------------------------------------
+// Fallback orchestration
+// ---------------------------------------------------------------------------
 
 export async function executeWithFallback(
   request: { method: string; path: string; headers: Record<string, string>; body: string },
   config: Config,
   logger: { logRequest: (entry: any) => void }
-): Promise<{ status: number; headers: Record<string, string>; body: string }> {
+): Promise<ForwardResult> {
   const startTime = Date.now();
-  const model = extractModelFromBody(request.body);
-  const resolved = resolveModel(model, config);
+  const requestedModel = extractModelFromBody(request.body);
 
-  // Build attempt chain: [primary, ...fallback]
+  // Rule-based routing: applies when user didn't manually select a known model
+  // (i.e., requested model is empty, equals defaultModel, or not found in config)
+  let routedModel = requestedModel;
+  const isUnresolvedRequest =
+    !requestedModel ||
+    requestedModel === config.router.defaultModel ||
+    !modelExists(requestedModel, config);
+  if (isUnresolvedRequest && config.router.rules) {
+    let parsedBody: any;
+    try {
+      parsedBody = JSON.parse(request.body);
+    } catch {
+      parsedBody = null;
+    }
+    const ruleMatch = evaluateRules(parsedBody, config.router.defaultModel, config.router.rules);
+    if (ruleMatch) {
+      const condStr = formatCondition(ruleMatch.condition);
+      console.log(`  [rules] Matched rule #${ruleMatch.index + 1} (${condStr}) -> ${ruleMatch.target}`);
+      routedModel = ruleMatch.target;
+    }
+  }
+
+  // Resolve primary: routed model, resolveModel falls back to default with warning if not found
+  const primaryResolved = resolveModel(routedModel, config);
+
   const attempts: string[] = [
-    `${resolved.name}/${resolved.model}`,
+    `${primaryResolved.name}/${primaryResolved.model}`,
     ...config.router.fallback
   ];
 
   const errors: Array<{ provider: string; status: number; error: string }> = [];
 
-  for (const attempt of attempts) {
+  for (let i = 0; i < attempts.length; i++) {
+    const attempt = attempts[i];
+    const hasMore = i < attempts.length - 1;
+
     try {
-      const attemptResolved = resolveModel(attempt, config);
-      const response = await forwardRequest(request, attemptResolved);
+      const resolved = resolveModel(attempt, config);
+      const result = await forwardRequest(request, resolved);
 
-      // Success
-      logger.logRequest({
-        timestamp: new Date().toISOString(),
-        method: request.method,
-        path: request.path,
-        model: attempt,
-        provider: attemptResolved.name,
-        statusCode: response.status,
-        durationMs: Date.now() - startTime,
-        usage: response.usage
-      });
+      if (hasMore && shouldFallbackAfterStatus(result.status)) {
+        // Drain streaming response if needed
+        if (result.responseStream) {
+          await result.responseStream.cancel().catch(() => {});
+        }
+        errors.push({ provider: attempt, status: result.status, error: `HTTP ${result.status}` });
+        continue;
+      }
 
-      return response;
+      if (result.isStreaming) {
+        // Streaming: defer logging until pipe completes (usage extracted from SSE)
+        result.logContext = {
+          timestamp: new Date().toISOString(),
+          method: request.method,
+          path: request.path,
+          requestedModel: requestedModel || undefined,
+          model: attempt,
+          provider: resolved.name,
+          durationMs: Date.now() - startTime,
+          statusCode: result.status
+        };
+      } else {
+        // Non-streaming: log immediately with usage from buffered response
+        logger.logRequest({
+          timestamp: new Date().toISOString(),
+          method: request.method,
+          path: request.path,
+          requestedModel: requestedModel || undefined,
+          model: attempt,
+          provider: resolved.name,
+          statusCode: result.status,
+          durationMs: Date.now() - startTime,
+          usage: result.usage
+        });
+      }
+
+      return result;
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : String(error);
-      errors.push({
-        provider: attempt,
-        status: 0,
-        error: errorMessage
-      });
+      errors.push({ provider: attempt, status: 0, error: errorMessage });
     }
   }
 
@@ -272,7 +422,8 @@ export async function executeWithFallback(
     timestamp: new Date().toISOString(),
     method: request.method,
     path: request.path,
-    model,
+    requestedModel: requestedModel || undefined,
+    model: requestedModel,
     provider: "all",
     statusCode: 502,
     durationMs: Date.now() - startTime,
@@ -282,7 +433,10 @@ export async function executeWithFallback(
   return {
     status: 502,
     headers: { "content-type": "application/json" },
-    body: JSON.stringify(errorResponse)
+    body: JSON.stringify(errorResponse),
+    isStreaming: false,
+    needsSseTransform: false,
+    transformModel: requestedModel
   };
 }
 
