@@ -101,25 +101,21 @@ import { createServer } from "node:http";
 
 // src/router.ts
 function resolveModel(model, config) {
-  const modelSelector = model || config.router.defaultModel;
-  const [providerName, ...modelNameParts] = modelSelector.split("/");
+  const [providerName, ...modelNameParts] = config.router.defaultModel.split("/");
   const modelName = modelNameParts.join("/");
   if (!providerName || !modelName) {
-    throw new Error(`Invalid model selector: ${modelSelector}. Expected format: provider/model`);
+    throw new Error(`Invalid default model in config: ${config.router.defaultModel}. Expected format: provider/model`);
   }
   const provider = config.providers.find((p) => p.name === providerName);
   if (!provider) {
-    throw new Error(`Unknown provider: ${providerName}`);
-  }
-  if (provider.model !== modelName) {
-    throw new Error(`Model ${modelName} not found in provider ${providerName}. Available: ${provider.model}`);
+    throw new Error(`Default provider ${providerName} not found in config`);
   }
   return {
     name: provider.name,
     type: provider.type,
     baseUrl: provider.baseUrl,
     apiKey: provider.apiKey,
-    model: modelName
+    model: provider.model
   };
 }
 async function forwardRequest(request, resolved) {
@@ -378,24 +374,37 @@ async function handleStart(args) {
 async function handleClaude(args) {
   const config = loadConfigFromDefault();
   const endpoint = `http://${config.server.host}:${config.server.port}`;
+  console.log(`Checking gateway at ${endpoint}...`);
   try {
     const response = await fetch(`${endpoint}/health`);
     if (!response.ok) {
       throw new Error("Gateway not responding");
     }
+    console.log("\u2713 Gateway is running");
   } catch (error) {
-    console.error("Gateway is not running. Start it with: mccr start");
+    console.error("\u2717 Gateway is not running. Start it with: mccr start");
     process.exit(1);
   }
-  console.log(`Gateway is running at ${endpoint}`);
-  console.log("Starting Claude Code...");
+  console.log(`
+Starting Claude Code with:`);
+  console.log(`  ANTHROPIC_BASE_URL=${endpoint}`);
+  console.log(`  ANTHROPIC_API_KEY=${config.providers[0]?.apiKey.substring(0, 10)}...`);
+  console.log(`Passing arguments: ${args.join(" ") || "(none)"}
+`);
   process.env.ANTHROPIC_BASE_URL = endpoint;
+  process.env.ANTHROPIC_API_KEY = config.providers[0]?.apiKey || "mccr-gateway";
   const { spawn } = await import("node:child_process");
   const claude = spawn("claude", args, {
     stdio: "inherit",
     env: process.env
   });
+  claude.on("error", (error) => {
+    console.error("Failed to start Claude Code:", error.message);
+    process.exit(1);
+  });
   claude.on("exit", (code) => {
+    console.log(`
+Claude Code exited with code ${code}`);
     process.exit(code || 0);
   });
 }
@@ -409,9 +418,7 @@ async function handleStatus() {
       console.log(`Endpoint: ${endpoint}`);
       console.log("\nAvailable Models:");
       for (const provider of config.providers) {
-        for (const model of provider.models) {
-          console.log(`  - ${provider.name}/${model}`);
-        }
+        console.log(`  - ${provider.name}/${provider.model}`);
       }
       console.log(`
 Default Model: ${config.router.defaultModel}`);

@@ -47,21 +47,27 @@ async function handleClaude(args: string[]) {
   const config = loadConfigFromDefault();
   const endpoint = `http://${config.server.host}:${config.server.port}`;
 
+  console.log(`Checking gateway at ${endpoint}...`);
   try {
     const response = await fetch(`${endpoint}/health`);
     if (!response.ok) {
       throw new Error("Gateway not responding");
     }
+    console.log("✓ Gateway is running");
   } catch (error) {
-    console.error("Gateway is not running. Start it with: mccr start");
+    console.error("✗ Gateway is not running. Start it with: mccr start");
     process.exit(1);
   }
 
-  console.log(`Gateway is running at ${endpoint}`);
-  console.log("Starting Claude Code...");
+  console.log(`\nStarting Claude Code with:`);
+  console.log(`  ANTHROPIC_BASE_URL=${endpoint}`);
+  console.log(`  ANTHROPIC_API_KEY=${config.providers[0]?.apiKey.substring(0, 10)}...`);
+  console.log(`Passing arguments: ${args.join(" ") || "(none)"}\n`);
 
-  // Set environment variable and spawn claude
+  // Set environment variables and spawn claude
   process.env.ANTHROPIC_BASE_URL = endpoint;
+  // Use a dummy API key since the gateway handles authentication
+  process.env.ANTHROPIC_API_KEY = config.providers[0]?.apiKey || "mccr-gateway";
 
   const { spawn } = await import("node:child_process");
   const claude = spawn("claude", args, {
@@ -69,7 +75,13 @@ async function handleClaude(args: string[]) {
     env: process.env
   });
 
+  claude.on("error", (error) => {
+    console.error("Failed to start Claude Code:", error.message);
+    process.exit(1);
+  });
+
   claude.on("exit", (code) => {
+    console.log(`\nClaude Code exited with code ${code}`);
     process.exit(code || 0);
   });
 }
@@ -85,9 +97,7 @@ async function handleStatus() {
       console.log(`Endpoint: ${endpoint}`);
       console.log("\nAvailable Models:");
       for (const provider of config.providers) {
-        for (const model of provider.models) {
-          console.log(`  - ${provider.name}/${model}`);
-        }
+        console.log(`  - ${provider.name}/${provider.model}`);
       }
       console.log(`\nDefault Model: ${config.router.defaultModel}`);
       if (config.router.fallback.length > 0) {

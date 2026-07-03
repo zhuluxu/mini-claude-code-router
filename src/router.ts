@@ -1,21 +1,17 @@
 import type { Config, ResolvedProvider } from "./types.js";
 
 export function resolveModel(model: string, config: Config): ResolvedProvider {
-  const modelSelector = model || config.router.defaultModel;
-  const [providerName, ...modelNameParts] = modelSelector.split("/");
+  // Gateway ignores the requested model name, always uses configured provider/model
+  const [providerName, ...modelNameParts] = config.router.defaultModel.split("/");
   const modelName = modelNameParts.join("/");
 
   if (!providerName || !modelName) {
-    throw new Error(`Invalid model selector: ${modelSelector}. Expected format: provider/model`);
+    throw new Error(`Invalid default model in config: ${config.router.defaultModel}. Expected format: provider/model`);
   }
 
   const provider = config.providers.find((p) => p.name === providerName);
   if (!provider) {
-    throw new Error(`Unknown provider: ${providerName}`);
-  }
-
-  if (provider.model !== modelName) {
-    throw new Error(`Model ${modelName} not found in provider ${providerName}. Available: ${provider.model}`);
+    throw new Error(`Default provider ${providerName} not found in config`);
   }
 
   return {
@@ -23,7 +19,7 @@ export function resolveModel(model: string, config: Config): ResolvedProvider {
     type: provider.type,
     baseUrl: provider.baseUrl,
     apiKey: provider.apiKey,
-    model: modelName
+    model: provider.model
   };
 }
 
