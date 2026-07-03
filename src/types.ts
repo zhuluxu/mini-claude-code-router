@@ -52,4 +52,10 @@ export interface LogEntry {
   statusCode: number;
   durationMs: number;
   error?: string;
+  usage?: {
+    inputTokens?: number;
+    outputTokens?: number;
+    cacheCreationInputTokens?: number;
+    cacheReadInputTokens?: number;
+  };
 }

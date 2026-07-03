@@ -119,31 +119,148 @@ function resolveModel(model, config) {
   };
 }
 async function forwardRequest(request, resolved) {
-  const url = `${resolved.baseUrl}${request.path}`;
+  let targetPath = request.path;
+  if (resolved.type === "openai_chat_completions") {
+    targetPath = "/v1/chat/completions";
+  } else if (resolved.type === "openai_responses") {
+    targetPath = "/v1/responses";
+  } else if (resolved.type === "anthropic_messages") {
+    targetPath = "/v1/messages";
+  } else if (resolved.type === "gemini_generate_content") {
+    targetPath = request.path;
+  }
+  const url = `${resolved.baseUrl}${targetPath}`;
+  console.log(`  Forwarding to: ${url}`);
+  console.log(`  Provider: ${resolved.name} (${resolved.type})`);
+  console.log(`  API Key: ${resolved.apiKey.substring(0, 10)}...`);
+  let bodyToSend = request.body;
+  if (request.body) {
+    try {
+      const parsed = JSON.parse(request.body);
+      if (parsed.model) {
+        console.log(`  Replacing model: ${parsed.model} -> ${resolved.model}`);
+        parsed.model = resolved.model;
+      }
+      if (resolved.type === "openai_chat_completions" || resolved.type === "openai_responses") {
+        if (parsed.system) {
+          const systemContent = typeof parsed.system === "string" ? parsed.system : Array.isArray(parsed.system) ? parsed.system.map((s) => s.text || s).join("\n") : "";
+          if (systemContent) {
+            parsed.messages = [
+              { role: "system", content: systemContent },
+              ...parsed.messages || []
+            ];
+          }
+          delete parsed.system;
+        }
+        if (parsed.messages) {
+          parsed.messages = parsed.messages.map((msg) => {
+            if (Array.isArray(msg.content)) {
+              const textParts = msg.content.filter((part) => part.type === "text").map((part) => part.text).join("\n");
+              return { role: msg.role, content: textParts };
+            }
+            return msg;
+          });
+        }
+        if (parsed.tools && Array.isArray(parsed.tools)) {
+          parsed.tools = parsed.tools.map((tool) => {
+            if (tool.input_schema) {
+              return {
+                type: "function",
+                function: {
+                  name: tool.name,
+                  description: tool.description || "",
+                  parameters: tool.input_schema
+                }
+              };
+            }
+            return tool;
+          });
+          console.log(`  Transformed: converted ${parsed.tools.length} tools to OpenAI format`);
+        }
+        if (parsed.max_tokens && !parsed.max_completion_tokens) {
+          parsed.max_completion_tokens = parsed.max_tokens;
+        }
+        delete parsed.thinking;
+        delete parsed.context_management;
+        delete parsed.output_config;
+        delete parsed.metadata;
+        delete parsed.stream;
+        console.log(`  Transformed: removed Anthropic-specific fields`);
+      }
+      bodyToSend = JSON.stringify(parsed);
+      console.log(`  Transformed body (first 500 chars): ${bodyToSend.substring(0, 500)}`);
+      console.log(`  Transformed body length: ${bodyToSend.length} bytes`);
+      console.log(`  Request fields: ${Object.keys(parsed).join(", ")}`);
+      if (parsed.stream) console.log(`  Stream: ${parsed.stream}`);
+      if (parsed.temperature) console.log(`  Temperature: ${parsed.temperature}`);
+      if (parsed.top_p) console.log(`  Top_p: ${parsed.top_p}`);
+      if (parsed.tools) console.log(`  Tools count: ${parsed.tools.length}`);
+      if (parsed.messages) console.log(`  Messages count: ${parsed.messages.length}`);
+    } catch {
+    }
+  }
   const headers = {
     ...request.headers,
     "content-type": "application/json"
   };
+  delete headers["x-api-key"];
+  delete headers["authorization"];
+  delete headers["anthropic-version"];
+  delete headers["content-length"];
   if (resolved.type === "anthropic_messages") {
     headers["x-api-key"] = resolved.apiKey;
     headers["anthropic-version"] = "2023-06-01";
+    console.log(`  Auth: x-api-key`);
   } else {
     headers["authorization"] = `Bearer ${resolved.apiKey}`;
+    console.log(`  Auth: Bearer token`);
   }
-  const response = await fetch(url, {
-    method: request.method,
-    headers,
-    body: request.method !== "GET" ? request.body : void 0
-  });
+  if (request.method !== "GET" && bodyToSend) {
+    headers["content-length"] = String(Buffer.byteLength(bodyToSend, "utf8"));
+  }
+  let response;
+  try {
+    response = await fetch(url, {
+      method: request.method,
+      headers,
+      body: request.method !== "GET" ? bodyToSend : void 0
+    });
+  } catch (error) {
+    console.error(`  Fetch error type: ${error?.constructor?.name}`);
+    console.error(`  Fetch error message: ${error?.message}`);
+    if (error?.cause) {
+      console.error(`  Fetch error cause: ${JSON.stringify(error.cause, null, 2)}`);
+    }
+    console.error(`  Full error: ${JSON.stringify(error, Object.getOwnPropertyNames(error), 2)}`);
+    throw error;
+  }
   const responseBody = await response.text();
   const responseHeaders = {};
   response.headers.forEach((value, key) => {
     responseHeaders[key] = value;
   });
+  let usage = void 0;
+  try {
+    const parsed = JSON.parse(responseBody);
+    if (parsed.usage) {
+      usage = {
+        inputTokens: parsed.usage.input_tokens || parsed.usage.prompt_tokens,
+        outputTokens: parsed.usage.output_tokens || parsed.usage.completion_tokens,
+        cacheCreationInputTokens: parsed.usage.cache_creation_input_tokens,
+        cacheReadInputTokens: parsed.usage.cache_read_input_tokens
+      };
+    }
+  } catch {
+  }
+  if (response.status !== 200) {
+    console.log(`  Response status: ${response.status}`);
+    console.log(`  Response body: ${responseBody.substring(0, 500)}`);
+  }
   return {
     status: response.status,
     headers: responseHeaders,
-    body: responseBody
+    body: responseBody,
+    usage
   };
 }
 async function executeWithFallback(request, config, logger) {
@@ -166,7 +283,8 @@ async function executeWithFallback(request, config, logger) {
         model: attempt,
         provider: attemptResolved.name,
         statusCode: response.status,
-        durationMs: Date.now() - startTime
+        durationMs: Date.now() - startTime,
+        usage: response.usage
       });
       return response;
     } catch (error) {
@@ -213,16 +331,44 @@ function extractModelFromBody(body) {
 // src/logger.ts
 import { appendFileSync } from "node:fs";
 var loggingConfig;
+var totalTokens = {
+  inputTokens: 0,
+  outputTokens: 0,
+  cacheCreationInputTokens: 0,
+  cacheReadInputTokens: 0,
+  requestCount: 0
+};
 function initLogger(config) {
   loggingConfig = config;
 }
 function logRequest(entry) {
   if (!loggingConfig?.enabled) return;
+  if (entry.usage) {
+    if (entry.usage.inputTokens) totalTokens.inputTokens += entry.usage.inputTokens;
+    if (entry.usage.outputTokens) totalTokens.outputTokens += entry.usage.outputTokens;
+    if (entry.usage.cacheCreationInputTokens) totalTokens.cacheCreationInputTokens += entry.usage.cacheCreationInputTokens;
+    if (entry.usage.cacheReadInputTokens) totalTokens.cacheReadInputTokens += entry.usage.cacheReadInputTokens;
+    totalTokens.requestCount++;
+  }
   const logLine = formatLogEntry(entry);
   if (loggingConfig.file) {
     appendFileSync(loggingConfig.file, logLine + "\n");
   } else {
     console.log(logLine);
+    if (totalTokens.requestCount % 10 === 0 && totalTokens.requestCount > 0) {
+      console.log(`
+\u{1F4CA} Cumulative Token Usage (last ${totalTokens.requestCount} requests):`);
+      console.log(`   Input tokens: ${totalTokens.inputTokens.toLocaleString()}`);
+      console.log(`   Output tokens: ${totalTokens.outputTokens.toLocaleString()}`);
+      if (totalTokens.cacheCreationInputTokens > 0) {
+        console.log(`   Cache creation: ${totalTokens.cacheCreationInputTokens.toLocaleString()}`);
+      }
+      if (totalTokens.cacheReadInputTokens > 0) {
+        console.log(`   Cache read: ${totalTokens.cacheReadInputTokens.toLocaleString()}`);
+      }
+      console.log(`   Total: ${(totalTokens.inputTokens + totalTokens.outputTokens).toLocaleString()} tokens
+`);
+    }
   }
 }
 function formatLogEntry(entry) {
@@ -234,6 +380,16 @@ function formatLogEntry(entry) {
     `status=${entry.statusCode}`,
     `duration=${entry.durationMs}ms`
   ];
+  if (entry.usage) {
+    const usageStr = [];
+    if (entry.usage.inputTokens) usageStr.push(`in=${entry.usage.inputTokens}`);
+    if (entry.usage.outputTokens) usageStr.push(`out=${entry.usage.outputTokens}`);
+    if (entry.usage.cacheCreationInputTokens) usageStr.push(`cache_create=${entry.usage.cacheCreationInputTokens}`);
+    if (entry.usage.cacheReadInputTokens) usageStr.push(`cache_read=${entry.usage.cacheReadInputTokens}`);
+    if (usageStr.length > 0) {
+      parts.push(`tokens=[${usageStr.join(", ")}]`);
+    }
+  }
   if (entry.error) {
     parts.push(`error=${entry.error}`);
   }
