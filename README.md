@@ -16,8 +16,20 @@
 
 ## 安装
 
+### 从 npm 安装
+
 ```bash
 npm install -g mini-claude-code-router
+```
+
+### 从源码安装
+
+```bash
+git clone https://github.com/zhuluxu/mini-claude-code-router.git
+cd mini-claude-code-router
+npm install
+npm run build
+npm link  # 将 mccr 命令链接到全局
 ```
 
 ## 快速开始
@@ -61,11 +73,26 @@ mccr start
 
 ### 3. 启动 Claude Code
 
+**方式一：使用 mccr claude（推荐）**
+
 ```bash
 mccr claude
 ```
 
 该命令会先检查网关健康状态，然后以 `ANTHROPIC_BASE_URL` 指向网关的方式启动 `claude`，无需手动设置环境变量。
+
+**方式二：直接使用 claude 命令**
+
+将环境变量写入 shell profile，之后直接 `claude` 即可：
+
+```bash
+echo 'export ANTHROPIC_BASE_URL=http://127.0.0.1:3456' >> ~/.bashrc
+echo 'export ANTHROPIC_API_KEY=mccr-gateway' >> ~/.bashrc
+source ~/.bashrc
+claude
+```
+
+`ANTHROPIC_API_KEY` 填任意非空值即可，网关会用配置里的真实 key 鉴权。端口需与 `config.json` 里的 `server.port` 一致。
 
 ## 配置说明
 
@@ -107,12 +134,14 @@ mccr claude
 
 ### Provider 类型
 
-| type | 协议 | 转发路径 |
-| --- | --- | --- |
-| `anthropic_messages` | Anthropic Messages API | `/v1/messages` |
-| `openai_chat_completions` | OpenAI Chat Completions API | `/v1/chat/completions` |
-| `openai_responses` | OpenAI Responses API | `/v1/responses` |
-| `gemini_generate_content` | Gemini GenerateContent API | 原始路径透传 |
+| type | 协议 | 转发路径 | 转换 |
+| --- | --- | --- | --- |
+| `anthropic_messages` | Anthropic Messages API | `/v1/messages` | 同协议透传 |
+| `openai_chat_completions` | OpenAI Chat Completions API | `/v1/chat/completions` | 双向协议转换 |
+| `openai_responses` | OpenAI Responses API | `/v1/responses` | 协议转换（实验性） |
+| `gemini_generate_content` | Gemini GenerateContent API | 原始路径透传 | 仅替换 auth 和 model |
+
+> `openai_responses` 当前复用 Chat Completions 的转换逻辑，对 Responses API 的兼容性有限，建议优先使用 `openai_chat_completions`。
 
 ### Provider 字段
 
@@ -213,8 +242,11 @@ mccr claude
 }
 ```
 
-- `file` 省略时输出到 stdout
-- 每 10 次请求打印一次累计 token 用量统计
+- `enabled` 为 `false` 时不记录任何请求日志（`console.log` 调试输出不受影响）
+- `file` 省略时输出到 stdout，每 10 次请求打印一次累计 token 用量统计
+- `file` 指定时追加写入文件，不打印累计统计
+
+> 后台运行（`mccr start`）时，`console.log` 输出（启动信息、请求摘要、规则命中）始终写入 `~/.config/mccr/gateway.log`，与 `logging` 配置无关。
 
 ### 记录内容
 
@@ -303,15 +335,32 @@ mccr claude -- --model claude-opus-4-20250514
 
 ### mccr status
 
-显示网关状态和可用模型。
+显示网关状态、可用模型和 fallback 链。
 
 ```bash
 mccr status
 ```
 
+输出示例：
+
+```
+Gateway Status: Running
+Endpoint: http://127.0.0.1:13456
+
+Available Models:
+  - opencode-qwen-plus/qwen3.7-plus
+  - opencode-deepseek-pro/deepseek-v4-pro
+
+Default Model: opencode-qwen-plus/qwen3.7-plus
+Fallback Chain:
+  1. opencode-deepseek-pro/deepseek-v4-pro
+```
+
 ## 协议转换能力
 
-当 Claude Code（使用 Anthropic Messages 协议）请求一个 OpenAI 协议的 Provider 时，网关会自动做双向转换：
+当 Claude Code（使用 Anthropic Messages 协议）请求一个 OpenAI 协议的 Provider 时，网关会自动做双向转换。
+
+> 仅 `openai_chat_completions` 和 `openai_responses` 类型触发协议转换。`anthropic_messages` 同协议透传，`gemini_generate_content` 仅替换 auth 和 model 名（不做格式转换）。
 
 ### 请求方向（Anthropic → OpenAI）
 
@@ -348,8 +397,10 @@ mccr status
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | GET | `/health` | 健康检查，返回 `{"status":"ok"}` |
-| GET | `/v1/models` | 列出配置的模型（静态，来自 config） |
+| GET | `/v1/models` | 列出配置的模型（静态，来自 config 的 providers） |
 | POST | `/v1/messages` | 核心端点，转发到上游 Provider |
+
+> Claude Code 的 `/model` 命令不会请求 `/v1/models`，它使用自身硬编码的模型列表。网关通过 `resolveModel` 将 Claude Code 请求的模型名映射到配置的 provider。
 
 ## 项目结构
 
@@ -364,12 +415,12 @@ src/
   server.ts     HTTP 服务、流式 pipe、SSE 转换
   logger.ts     请求日志、累计 token 统计
 tests/
-  config.test.ts    配置校验测试
-  router.test.ts    模型解析 + 规则路由测试（18 例）
+  config.test.ts    配置校验测试（5 例）
+  router.test.ts    模型解析 + 规则路由测试（19 例）
   transform.test.ts 协议转换测试（21 例）
   sse-usage.test.ts SSE usage 提取测试（9 例）
-  server.test.ts    服务启动测试
-  cli.test.ts       进程管理测试
+  server.test.ts    服务启动测试（1 例）
+  cli.test.ts       进程管理测试（6 例）
 ```
 
 ## 开发
@@ -378,9 +429,9 @@ tests/
 npm run dev        # tsx 直接运行
 npm run build      # esbuild 打包到 dist/
 npm run typecheck  # tsc 类型检查
-npm test           # vitest 运行测试
+npm test           # vitest 运行测试（61 例）
 ```
 
 ## 许可证
 
-MIT
+[MIT](LICENSE)

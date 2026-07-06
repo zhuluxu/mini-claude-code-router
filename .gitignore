@@ -3,3 +3,26 @@ dist/
 *.log
 .DS_Store
 .env
+
+# Claude Code / opencode
+.claude/
+.opencode/
+
+# Project docs (not for repo)
+docs/superpowers/
+openspec/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+Thumbs.db
+
+# Test coverage
+coverage/
+
+# Local config (user-specific, not for repo)
+*.local
