@@ -145,6 +145,17 @@ claude
 
 > `openai_responses` 当前复用 Chat Completions 的转换逻辑，对 Responses API 的兼容性有限，建议优先使用 `openai_chat_completions`。
 
+#### 怎么判断该选哪个？
+
+看上游 API 的端点路径：
+
+- 端点路径含 `/v1/messages` → `anthropic_messages`
+- 端点路径含 `/v1/chat/completions` → `openai_chat_completions`
+- 端点路径含 `/v1/responses` → `openai_responses`
+- 端点路径含 `generateContent` → `gemini_generate_content`
+
+大多数第三方模型服务（DeepSeek、通义、mimo 等）都走 `openai_chat_completions`，兼容性最广。如果使用聚合平台（如 OpenRouter）同时支持多种协议，优先选 `anthropic_messages`（同协议透传不丢字段），不行再换 `openai_chat_completions`。
+
 ### Provider 字段
 
 | 字段 | 说明 |
@@ -231,6 +242,70 @@ claude
 | `messagesLt` | `number` | `messages.length < N` |
 
 同一 `when` 里多个字段用 **AND** 逻辑（全部满足才命中）。规则按数组顺序匹配，命中第一个后停止。命中时日志会打印规则序号和条件，如 `[rules] Matched rule #3 (tools=false, messages<3) -> haiku/claude-3-5-haiku`。
+
+#### 模型分三档使用
+
+把模型按能力和成本分档，配规则时对号入座：
+
+| 档位 | 模型特征 | 适合的任务 | 典型模型 |
+| --- | --- | --- | --- |
+| 轻量档 | 便宜、快、能力够用 | 简单问答、短消息、格式转换 | Haiku、mimo、Qwen-Turbo、GPT-4o-mini |
+| 平衡档 | 中等价格、能力全面 | 代码生成、工具调用、常规 agentic 任务 | Sonnet、Qwen-Plus、DeepSeek、GLM-4 |
+| 强力档 | 贵、推理强、复杂任务 | 深度推理、长链 agentic、架构设计 | Opus、DeepSeek-Pro/Reasoner、o1/o3 |
+
+#### 规则与模型匹配建议
+
+**简单问答 → 轻量档**
+
+```json
+{ "when": { "tools": false, "messagesLt": 3 }, "target": "mimo/mimo-v2.5-pro" }
+```
+
+无工具调用（非 agentic），对话短（一问一答）。走最便宜的模型。
+
+**常规代码任务 → 平衡档**
+
+```json
+{ "when": { "tools": true, "messagesGte": 3 }, "target": "qwen/qwen3.7-plus" }
+```
+
+有工具调用（读写文件、跑命令），对话有长度（多轮 agentic）。平衡档代码能力和工具调用都靠得住。
+
+**深度推理 → 强力档**
+
+```json
+{ "when": { "thinking": true, "tools": true, "messagesGte": 10 }, "target": "deepseek/deepseek-v4-pro" }
+```
+
+Claude Code 自动加了 `thinking`（深度思考），且有工具且对话已很长（复杂多步 agentic + 推理）。走强力档。
+
+**简单推理 → 平衡档**
+
+```json
+{ "when": { "thinking": true, "tools": false, "messagesLt": 3 }, "target": "qwen/qwen3.7-plus" }
+```
+
+有 thinking 但无工具，对话短（开了思考模式但只问个稍复杂的问题）。平衡档足够，不用上强力档。
+
+**长对话无工具 → 强力档**
+
+```json
+{ "when": { "thinking": true, "tools": false, "messagesGte": 3 }, "target": "deepseek/deepseek-v4-pro" }
+```
+
+有 thinking 且对话长（多轮深度讨论，可能在做架构设计或方案论证）。需强力档的长上下文和推理质量。
+
+#### 规则顺序原则
+
+规则按数组顺序匹配，命中第一个就停止。**越具体的规则越靠前，越宽泛的越靠后**：
+
+1. `thinking + tools + 长对话` → 强力档（最具体）
+2. `thinking + 无工具 + 短对话` → 平衡档
+3. `thinking + 无工具 + 长对话` → 强力档
+4. `tools + 长对话` → 平衡档
+5. `无工具 + 短对话` → 轻量档（最宽泛，兜底）
+
+最后用 `defaultModel` 兜底所有未命中的请求，通常设为平衡档。
 
 ### 日志配置
 
