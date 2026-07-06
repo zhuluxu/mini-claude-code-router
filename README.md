@@ -22,6 +22,8 @@
 npm install -g mini-claude-code-router
 ```
 
+> — 暂未发布到 npm，后续会上线。当前请使用从源码安装。
+
 ### 从源码安装
 
 ```bash
