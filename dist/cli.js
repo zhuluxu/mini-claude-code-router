@@ -500,6 +500,388 @@ data: ${JSON.stringify(data)}
 `;
   }
 };
+function transformRequestToGemini(body) {
+  const out = {};
+  if (body.system !== void 0) {
+    out.systemInstruction = convertSystemToGemini(body.system);
+  }
+  if (Array.isArray(body.messages)) {
+    const toolNameMap = /* @__PURE__ */ new Map();
+    for (const msg of body.messages) {
+      if (Array.isArray(msg.content)) {
+        for (const block of msg.content) {
+          if (block.type === "tool_use" && block.id && block.name) {
+            toolNameMap.set(block.id, block.name);
+          }
+        }
+      }
+    }
+    const systemParts = [];
+    const contents = [];
+    for (const msg of body.messages) {
+      if (msg.role === "system") {
+        const converted = convertAnthropicMessageToGemini(msg, toolNameMap);
+        systemParts.push(...converted.parts);
+      } else {
+        contents.push(convertAnthropicMessageToGemini(msg, toolNameMap));
+      }
+    }
+    out.contents = contents;
+    if (systemParts.length > 0) {
+      if (out.systemInstruction) {
+        out.systemInstruction.parts.push(...systemParts);
+      } else {
+        out.systemInstruction = { parts: systemParts };
+      }
+    }
+  }
+  if (Array.isArray(body.tools) && body.tools.length > 0) {
+    out.tools = [{ functionDeclarations: body.tools.map(convertAnthropicToolToGemini) }];
+  }
+  if (body.tool_choice !== void 0) {
+    out.toolConfig = convertToolChoiceToGemini(body.tool_choice);
+  }
+  const genConfig = {};
+  if (body.max_tokens !== void 0) genConfig.maxOutputTokens = body.max_tokens;
+  if (body.temperature !== void 0) genConfig.temperature = body.temperature;
+  if (body.top_p !== void 0) genConfig.topP = body.top_p;
+  if (body.stop_sequences !== void 0) genConfig.stopSequences = body.stop_sequences;
+  if (Object.keys(genConfig).length > 0) out.generationConfig = genConfig;
+  return out;
+}
+function convertSystemToGemini(system) {
+  if (typeof system === "string") {
+    return { parts: [{ text: system }] };
+  }
+  if (Array.isArray(system)) {
+    return {
+      parts: system.map((s) => {
+        if (typeof s === "string") return { text: s };
+        if (s?.text) return { text: s.text };
+        return null;
+      }).filter(Boolean)
+    };
+  }
+  return { parts: [] };
+}
+function convertAnthropicMessageToGemini(msg, toolNameMap) {
+  const role = msg.role === "assistant" ? "model" : msg.role;
+  if (typeof msg.content === "string") {
+    return { role, parts: [{ text: msg.content }] };
+  }
+  if (!Array.isArray(msg.content)) {
+    return { role, parts: [{ text: msg.content }] };
+  }
+  const parts = [];
+  for (const block of msg.content) {
+    if (block.type === "text") {
+      parts.push({ text: block.text });
+    } else if (block.type === "tool_use") {
+      parts.push({
+        functionCall: {
+          name: block.name,
+          args: block.input ?? {}
+        }
+      });
+    } else if (block.type === "tool_result") {
+      const name = toolNameMap.get(block.tool_use_id) || block.tool_use_id;
+      const content = extractGeminiToolResultContent(block.content);
+      parts.push({
+        functionResponse: {
+          name,
+          response: { output: content }
+        }
+      });
+    } else if (block.type === "image") {
+      if (block.source?.type === "base64") {
+        parts.push({
+          inlineData: {
+            mimeType: block.source.media_type || "image/png",
+            data: block.source.data
+          }
+        });
+      }
+    }
+  }
+  if (parts.length === 0) {
+    parts.push({ text: "" });
+  }
+  return { role, parts };
+}
+function extractGeminiToolResultContent(content) {
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return content.map((c) => {
+      if (typeof c === "string") return c;
+      if (c.type === "text") return c.text;
+      return "";
+    }).filter(Boolean).join("\n");
+  }
+  if (content && typeof content === "object") return content.text || "";
+  return "";
+}
+function convertAnthropicToolToGemini(tool) {
+  return {
+    name: tool.name,
+    description: tool.description || "",
+    parameters: cleanSchemaForGemini(tool.input_schema) || { type: "object", properties: {} }
+  };
+}
+var GEMINI_ALLOWED_SCHEMA_KEYS = /* @__PURE__ */ new Set([
+  "type",
+  "description",
+  "enum",
+  "format",
+  "default",
+  "items",
+  "properties",
+  "required",
+  "anyOf",
+  "allOf",
+  "oneOf"
+]);
+function cleanSchemaForGemini(node) {
+  if (Array.isArray(node)) {
+    return node.map(cleanSchemaForGemini);
+  }
+  if (node && typeof node === "object") {
+    const out = {};
+    for (const [key, value] of Object.entries(node)) {
+      if (!GEMINI_ALLOWED_SCHEMA_KEYS.has(key)) continue;
+      if (key === "properties" && value && typeof value === "object") {
+        const cleanedProps = {};
+        for (const [propName, propSchema] of Object.entries(value)) {
+          cleanedProps[propName] = cleanSchemaForGemini(propSchema);
+        }
+        out[key] = cleanedProps;
+      } else {
+        out[key] = cleanSchemaForGemini(value);
+      }
+    }
+    return out;
+  }
+  return node;
+}
+function convertToolChoiceToGemini(choice) {
+  if (typeof choice === "string") {
+    if (choice === "auto") return { functionCallingConfig: { mode: "AUTO" } };
+    if (choice === "any") return { functionCallingConfig: { mode: "ANY" } };
+    if (choice === "none") return { functionCallingConfig: { mode: "NONE" } };
+    return { functionCallingConfig: { mode: "AUTO" } };
+  }
+  if (choice && typeof choice === "object" && choice.type === "tool") {
+    return {
+      functionCallingConfig: {
+        mode: "ANY",
+        allowedFunctionNames: [choice.name]
+      }
+    };
+  }
+  return { functionCallingConfig: { mode: "AUTO" } };
+}
+function transformResponseFromGemini(body, model) {
+  const candidate = body.candidates?.[0];
+  const parts = candidate?.content?.parts || [];
+  const content = [];
+  let toolUseCounter = 0;
+  for (const part of parts) {
+    if (part.thought && part.text !== void 0) {
+      content.push({ type: "thinking", thinking: part.text });
+    } else if (part.text !== void 0) {
+      content.push({ type: "text", text: part.text });
+    } else if (part.functionCall) {
+      content.push({
+        type: "tool_use",
+        id: `toolu_${Date.now()}_${toolUseCounter++}`,
+        name: part.functionCall.name,
+        input: part.functionCall.args || {}
+      });
+    }
+  }
+  let stopReason = convertGeminiFinishReasonToStopReason(candidate?.finishReason);
+  if (stopReason === "end_turn" && content.some((c) => c.type === "tool_use")) {
+    stopReason = "tool_use";
+  }
+  return {
+    id: `msg_${Date.now()}`,
+    type: "message",
+    role: "assistant",
+    content,
+    model,
+    stop_reason: stopReason,
+    stop_sequence: null,
+    usage: {
+      input_tokens: body.usageMetadata?.promptTokenCount || 0,
+      output_tokens: body.usageMetadata?.candidatesTokenCount || 0,
+      cache_creation_input_tokens: 0,
+      cache_read_input_tokens: body.usageMetadata?.cachedContentTokenCount || 0
+    }
+  };
+}
+function convertGeminiFinishReasonToStopReason(finishReason) {
+  switch (finishReason) {
+    case "STOP":
+      return "end_turn";
+    case "MAX_TOKENS":
+      return "max_tokens";
+    case "TOOL_USE":
+      return "tool_use";
+    case "SAFETY":
+    case "RECITATION":
+    case "OTHER":
+      return "end_turn";
+    default:
+      return "end_turn";
+  }
+}
+var GeminiToAnthropicSseTransformer = class {
+  messageStarted = false;
+  messageStopped = false;
+  currentBlockIndex = -1;
+  currentBlockType = null;
+  hadToolUse = false;
+  model;
+  messageId;
+  inputTokens = 0;
+  outputTokens = 0;
+  toolUseCounter = 0;
+  constructor(model) {
+    this.model = model;
+    this.messageId = `msg_${Date.now()}`;
+  }
+  getUsage() {
+    return { inputTokens: this.inputTokens, outputTokens: this.outputTokens };
+  }
+  transformDataLine(data) {
+    let chunk;
+    try {
+      chunk = JSON.parse(data);
+    } catch {
+      return [];
+    }
+    if (chunk.usageMetadata?.promptTokenCount) {
+      this.inputTokens = chunk.usageMetadata.promptTokenCount;
+    }
+    const events = [];
+    const candidate = chunk.candidates?.[0];
+    const parts = candidate?.content?.parts || [];
+    if (!this.messageStarted) {
+      events.push(this.formatEvent("message_start", {
+        type: "message_start",
+        message: {
+          id: this.messageId,
+          type: "message",
+          role: "assistant",
+          content: [],
+          model: this.model,
+          stop_reason: null,
+          stop_sequence: null,
+          usage: { input_tokens: this.inputTokens, output_tokens: 0 }
+        }
+      }));
+      this.messageStarted = true;
+    }
+    for (const part of parts) {
+      if (part.thought && part.text !== void 0) {
+        if (this.currentBlockType !== "thinking") {
+          events.push(...this.closeCurrentBlock());
+          this.currentBlockIndex++;
+          this.currentBlockType = "thinking";
+          events.push(this.formatEvent("content_block_start", {
+            type: "content_block_start",
+            index: this.currentBlockIndex,
+            content_block: { type: "thinking", thinking: "" }
+          }));
+        }
+        events.push(this.formatEvent("content_block_delta", {
+          type: "content_block_delta",
+          index: this.currentBlockIndex,
+          delta: { type: "thinking_delta", thinking: part.text }
+        }));
+      } else if (part.text !== void 0) {
+        if (this.currentBlockType !== "text") {
+          events.push(...this.closeCurrentBlock());
+          this.currentBlockIndex++;
+          this.currentBlockType = "text";
+          events.push(this.formatEvent("content_block_start", {
+            type: "content_block_start",
+            index: this.currentBlockIndex,
+            content_block: { type: "text", text: "" }
+          }));
+        }
+        events.push(this.formatEvent("content_block_delta", {
+          type: "content_block_delta",
+          index: this.currentBlockIndex,
+          delta: { type: "text_delta", text: part.text }
+        }));
+      } else if (part.functionCall) {
+        events.push(...this.closeCurrentBlock());
+        this.currentBlockIndex++;
+        this.currentBlockType = "tool_use";
+        this.hadToolUse = true;
+        const toolId = `toolu_${Date.now()}_${this.toolUseCounter++}`;
+        events.push(this.formatEvent("content_block_start", {
+          type: "content_block_start",
+          index: this.currentBlockIndex,
+          content_block: {
+            type: "tool_use",
+            id: toolId,
+            name: part.functionCall.name,
+            input: {}
+          }
+        }));
+        const argsJson = JSON.stringify(part.functionCall.args || {});
+        events.push(this.formatEvent("content_block_delta", {
+          type: "content_block_delta",
+          index: this.currentBlockIndex,
+          delta: { type: "input_json_delta", partial_json: argsJson }
+        }));
+      }
+    }
+    if (candidate?.finishReason) {
+      events.push(...this.handleFinish(candidate.finishReason, chunk.usageMetadata));
+    }
+    return events;
+  }
+  closeCurrentBlock() {
+    const events = [];
+    if (this.currentBlockIndex >= 0) {
+      events.push(this.formatEvent("content_block_stop", {
+        type: "content_block_stop",
+        index: this.currentBlockIndex
+      }));
+      this.currentBlockIndex = -1;
+      this.currentBlockType = null;
+    }
+    return events;
+  }
+  handleFinish(finishReason, usageMetadata) {
+    const events = [];
+    events.push(...this.closeCurrentBlock());
+    this.outputTokens = usageMetadata?.candidatesTokenCount || this.outputTokens;
+    if (usageMetadata?.promptTokenCount) {
+      this.inputTokens = usageMetadata.promptTokenCount;
+    }
+    let stopReason = convertGeminiFinishReasonToStopReason(finishReason);
+    if (stopReason === "end_turn" && this.hadToolUse) {
+      stopReason = "tool_use";
+    }
+    events.push(this.formatEvent("message_delta", {
+      type: "message_delta",
+      delta: { stop_reason: stopReason, stop_sequence: null },
+      usage: { output_tokens: this.outputTokens }
+    }));
+    events.push(this.formatEvent("message_stop", { type: "message_stop" }));
+    this.messageStopped = true;
+    return events;
+  }
+  formatEvent(eventType, data) {
+    return `event: ${eventType}
+data: ${JSON.stringify(data)}
+
+`;
+  }
+};
 function parseSseChunk(raw, carry) {
   const text = carry + raw;
   const parts = text.split("\n");
@@ -566,6 +948,8 @@ function shouldFallbackAfterStatus(statusCode) {
 async function forwardRequest(request, resolved) {
   const isCrossProtocol = resolved.type === "openai_chat_completions" || resolved.type === "openai_responses";
   const isAnthropicProtocol = resolved.type === "anthropic_messages";
+  const isGemini = resolved.type === "gemini_generate_content";
+  const needsTransform = isCrossProtocol || isGemini;
   let targetPath = request.path;
   if (resolved.type === "openai_chat_completions") {
     targetPath = "/v1/chat/completions";
@@ -574,14 +958,21 @@ async function forwardRequest(request, resolved) {
   } else if (resolved.type === "anthropic_messages") {
     targetPath = "/v1/messages";
   }
-  const url = `${resolved.baseUrl}${targetPath}`;
   let bodyToSend = request.body;
   let isStreamingRequest = false;
   if (request.body) {
     try {
       const parsed = JSON.parse(request.body);
       isStreamingRequest = parsed.stream === true;
-      if (isCrossProtocol) {
+      if (isGemini) {
+        const transformed = transformRequestToGemini(parsed);
+        bodyToSend = JSON.stringify(transformed);
+        if (isStreamingRequest) {
+          targetPath = `/v1/models/${resolved.model}:streamGenerateContent?alt=sse`;
+        } else {
+          targetPath = `/v1/models/${resolved.model}:generateContent`;
+        }
+      } else if (isCrossProtocol) {
         const transformed = transformRequestToOpenAI(parsed);
         transformed.model = resolved.model;
         bodyToSend = JSON.stringify(transformed);
@@ -592,6 +983,10 @@ async function forwardRequest(request, resolved) {
     } catch {
     }
   }
+  if (isGemini && targetPath === request.path) {
+    targetPath = `/v1/models/${resolved.model}:generateContent`;
+  }
+  const url = `${resolved.baseUrl}${targetPath}`;
   const headers = {};
   if (isAnthropicProtocol) {
     for (const [key, value] of Object.entries(request.headers)) {
@@ -605,6 +1000,9 @@ async function forwardRequest(request, resolved) {
     if (!headers["anthropic-version"]) {
       headers["anthropic-version"] = "2023-06-01";
     }
+  } else if (isGemini) {
+    headers["content-type"] = "application/json";
+    headers["x-goog-api-key"] = resolved.apiKey;
   } else if (isCrossProtocol) {
     headers["content-type"] = "application/json";
     headers["authorization"] = `Bearer ${resolved.apiKey}`;
@@ -634,9 +1032,9 @@ async function forwardRequest(request, resolved) {
   });
   const contentType = response.headers.get("content-type") || "";
   const isStreaming = contentType.includes("text/event-stream") || isStreamingRequest && response.status === 200;
-  const needsSseTransform = isStreaming && isCrossProtocol;
+  const needsSseTransform = isStreaming && needsTransform;
   if (isStreaming && response.body) {
-    if (isCrossProtocol) {
+    if (needsTransform) {
       responseHeaders["content-type"] = "text/event-stream; charset=utf-8";
     }
     return {
@@ -645,22 +1043,35 @@ async function forwardRequest(request, resolved) {
       responseStream: response.body,
       isStreaming: true,
       needsSseTransform,
-      transformModel: resolved.model
+      transformModel: resolved.model,
+      providerType: resolved.type
     };
   }
   const responseBody = await response.text();
   let finalBody = responseBody;
   let usage;
-  if (isCrossProtocol) {
+  if (needsTransform) {
     try {
       const parsed = JSON.parse(responseBody);
-      if (parsed.choices && Array.isArray(parsed.choices)) {
-        const anthropicResponse = transformResponseFromOpenAI(parsed, resolved.model);
-        finalBody = JSON.stringify(anthropicResponse);
-        usage = {
-          inputTokens: anthropicResponse.usage.input_tokens,
-          outputTokens: anthropicResponse.usage.output_tokens
-        };
+      if (isGemini) {
+        if (parsed.candidates) {
+          const anthropicResponse = transformResponseFromGemini(parsed, resolved.model);
+          finalBody = JSON.stringify(anthropicResponse);
+          usage = {
+            inputTokens: anthropicResponse.usage.input_tokens,
+            outputTokens: anthropicResponse.usage.output_tokens,
+            cacheReadInputTokens: anthropicResponse.usage.cache_read_input_tokens
+          };
+        }
+      } else {
+        if (parsed.choices && Array.isArray(parsed.choices)) {
+          const anthropicResponse = transformResponseFromOpenAI(parsed, resolved.model);
+          finalBody = JSON.stringify(anthropicResponse);
+          usage = {
+            inputTokens: anthropicResponse.usage.input_tokens,
+            outputTokens: anthropicResponse.usage.output_tokens
+          };
+        }
       }
     } catch {
     }
@@ -686,6 +1097,7 @@ async function forwardRequest(request, resolved) {
     isStreaming: false,
     needsSseTransform: false,
     transformModel: resolved.model,
+    providerType: resolved.type,
     usage
   };
 }
@@ -1053,7 +1465,11 @@ async function writeResultToResponse(result, res, logRequestFn) {
     let transformer = null;
     let usageExtractor = null;
     if (result.needsSseTransform && result.transformModel) {
-      transformer = new OpenAIToAnthropicSseTransformer(result.transformModel);
+      if (result.providerType === "gemini_generate_content") {
+        transformer = new GeminiToAnthropicSseTransformer(result.transformModel);
+      } else {
+        transformer = new OpenAIToAnthropicSseTransformer(result.transformModel);
+      }
       const transformStream = createSseTransformStream(transformer);
       nodeStream.pipe(transformStream).pipe(res);
     } else {

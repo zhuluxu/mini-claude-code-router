@@ -1,7 +1,9 @@
 import type { Config, ResolvedProvider, RouterRule, RouterRuleCondition } from "./types.js";
 import {
   transformRequestToOpenAI,
-  transformResponseFromOpenAI
+  transformResponseFromOpenAI,
+  transformRequestToGemini,
+  transformResponseFromGemini
 } from "./transform.js";
 
 // ---------------------------------------------------------------------------
@@ -16,6 +18,7 @@ export interface ForwardResult {
   isStreaming: boolean;
   needsSseTransform: boolean;
   transformModel?: string;
+  providerType?: string;
   usage?: any;
   // Context for deferred logging (streaming responses log after pipe completes)
   logContext?: {
@@ -105,6 +108,8 @@ export async function forwardRequest(
   const isCrossProtocol =
     resolved.type === "openai_chat_completions" || resolved.type === "openai_responses";
   const isAnthropicProtocol = resolved.type === "anthropic_messages";
+  const isGemini = resolved.type === "gemini_generate_content";
+  const needsTransform = isCrossProtocol || isGemini;
 
   // Build target URL
   let targetPath = request.path;
@@ -116,8 +121,6 @@ export async function forwardRequest(
     targetPath = "/v1/messages";
   }
 
-  const url = `${resolved.baseUrl}${targetPath}`;
-
   // Prepare body
   let bodyToSend = request.body;
   let isStreamingRequest = false;
@@ -127,12 +130,20 @@ export async function forwardRequest(
       const parsed = JSON.parse(request.body);
       isStreamingRequest = parsed.stream === true;
 
-      if (isCrossProtocol) {
+      if (isGemini) {
+        const transformed = transformRequestToGemini(parsed);
+        bodyToSend = JSON.stringify(transformed);
+        if (isStreamingRequest) {
+          targetPath = `/v1/models/${resolved.model}:streamGenerateContent?alt=sse`;
+        } else {
+          targetPath = `/v1/models/${resolved.model}:generateContent`;
+        }
+      } else if (isCrossProtocol) {
         const transformed = transformRequestToOpenAI(parsed);
         transformed.model = resolved.model;
         bodyToSend = JSON.stringify(transformed);
       } else {
-        // Same protocol (anthropic_messages, gemini): only replace model, preserve everything
+        // Same protocol (anthropic_messages): only replace model, preserve everything
         parsed.model = resolved.model;
         bodyToSend = JSON.stringify(parsed);
       }
@@ -140,6 +151,13 @@ export async function forwardRequest(
       // Not JSON, forward as-is
     }
   }
+
+  // Gemini default path when no body or unparseable body
+  if (isGemini && targetPath === request.path) {
+    targetPath = `/v1/models/${resolved.model}:generateContent`;
+  }
+
+  const url = `${resolved.baseUrl}${targetPath}`;
 
   // Build headers
   const headers: Record<string, string> = {};
@@ -159,6 +177,9 @@ export async function forwardRequest(
     if (!headers["anthropic-version"]) {
       headers["anthropic-version"] = "2023-06-01";
     }
+  } else if (isGemini) {
+    headers["content-type"] = "application/json";
+    headers["x-goog-api-key"] = resolved.apiKey;
   } else if (isCrossProtocol) {
     // Strip Anthropic headers, add OpenAI auth
     headers["content-type"] = "application/json";
@@ -166,7 +187,7 @@ export async function forwardRequest(
     const accept = request.headers["accept"];
     if (accept) headers["accept"] = accept;
   } else {
-    // Gemini or other: forward headers, replace auth
+    // Unknown protocol: forward headers, replace auth with Anthropic-style key
     for (const [key, value] of Object.entries(request.headers)) {
       const lower = key.toLowerCase();
       if (lower === "x-api-key" || lower === "authorization" || lower === "content-length" || lower === "host") continue;
@@ -199,11 +220,11 @@ export async function forwardRequest(
   const isStreaming =
     contentType.includes("text/event-stream") || (isStreamingRequest && response.status === 200);
 
-  const needsSseTransform = isStreaming && isCrossProtocol;
+  const needsSseTransform = isStreaming && needsTransform;
 
   if (isStreaming && response.body) {
     // For cross-protocol, set content-type to Anthropic SSE format
-    if (isCrossProtocol) {
+    if (needsTransform) {
       responseHeaders["content-type"] = "text/event-stream; charset=utf-8";
     }
     return {
@@ -212,7 +233,8 @@ export async function forwardRequest(
       responseStream: response.body,
       isStreaming: true,
       needsSseTransform,
-      transformModel: resolved.model
+      transformModel: resolved.model,
+      providerType: resolved.type
     };
   }
 
@@ -221,16 +243,28 @@ export async function forwardRequest(
   let finalBody = responseBody;
   let usage: any;
 
-  if (isCrossProtocol) {
+  if (needsTransform) {
     try {
       const parsed = JSON.parse(responseBody);
-      if (parsed.choices && Array.isArray(parsed.choices)) {
-        const anthropicResponse = transformResponseFromOpenAI(parsed, resolved.model);
-        finalBody = JSON.stringify(anthropicResponse);
-        usage = {
-          inputTokens: anthropicResponse.usage.input_tokens,
-          outputTokens: anthropicResponse.usage.output_tokens
-        };
+      if (isGemini) {
+        if (parsed.candidates) {
+          const anthropicResponse = transformResponseFromGemini(parsed, resolved.model);
+          finalBody = JSON.stringify(anthropicResponse);
+          usage = {
+            inputTokens: anthropicResponse.usage.input_tokens,
+            outputTokens: anthropicResponse.usage.output_tokens,
+            cacheReadInputTokens: anthropicResponse.usage.cache_read_input_tokens
+          };
+        }
+      } else {
+        if (parsed.choices && Array.isArray(parsed.choices)) {
+          const anthropicResponse = transformResponseFromOpenAI(parsed, resolved.model);
+          finalBody = JSON.stringify(anthropicResponse);
+          usage = {
+            inputTokens: anthropicResponse.usage.input_tokens,
+            outputTokens: anthropicResponse.usage.output_tokens
+          };
+        }
       }
     } catch {
       // Conversion failed, use original body
@@ -260,6 +294,7 @@ export async function forwardRequest(
     isStreaming: false,
     needsSseTransform: false,
     transformModel: resolved.model,
+    providerType: resolved.type,
     usage
   };
 }

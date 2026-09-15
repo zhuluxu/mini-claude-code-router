@@ -7,7 +7,7 @@
 - 极简配置：一个 JSON 文件即可运行
 - 多 Provider 路由：按 `provider/model` 选择器路由到不同上游
 - 规则路由：根据 `thinking`/`tools`/`messages` 长度自动选择模型（简单任务走轻量模型，复杂推理走强模型）
-- 跨协议转换：Anthropic Messages ↔ OpenAI Chat Completions 双向转换（含工具调用、流式）
+- 跨协议转换：Anthropic Messages ↔ OpenAI Chat Completions / Gemini GenerateContent 双向转换（含工具调用、流式）
 - 失败降级：主 Provider 返回 429/5xx 或网络错误时自动切换到备用 Provider
 - 流式透传：SSE 流实时 pipe 到客户端，保留增量输出与中途取消能力
 - 请求日志：记录每次请求的原始模型、路由模型、命中规则、provider、状态码、耗时、token 用量
@@ -141,7 +141,7 @@ claude
 | `anthropic_messages` | Anthropic Messages API | `/v1/messages` | 同协议透传 |
 | `openai_chat_completions` | OpenAI Chat Completions API | `/v1/chat/completions` | 双向协议转换 |
 | `openai_responses` | OpenAI Responses API | `/v1/responses` | 协议转换（实验性） |
-| `gemini_generate_content` | Gemini GenerateContent API | 原始路径透传 | 仅替换 auth 和 model |
+| `gemini_generate_content` | Gemini GenerateContent API | `/v1/models/{model}:generateContent` | 双向协议转换 |
 
 > `openai_responses` 当前复用 Chat Completions 的转换逻辑，对 Responses API 的兼容性有限，建议优先使用 `openai_chat_completions`。
 
@@ -437,7 +437,7 @@ Fallback Chain:
 
 当 Claude Code（使用 Anthropic Messages 协议）请求一个 OpenAI 协议的 Provider 时，网关会自动做双向转换。
 
-> 仅 `openai_chat_completions` 和 `openai_responses` 类型触发协议转换。`anthropic_messages` 同协议透传，`gemini_generate_content` 仅替换 auth 和 model 名（不做格式转换）。
+> 仅 `openai_chat_completions`、`openai_responses` 和 `gemini_generate_content` 类型触发协议转换。`anthropic_messages` 同协议透传。
 
 ### 请求方向（Anthropic → OpenAI）
 
@@ -463,6 +463,36 @@ Fallback Chain:
 - `message_start` / `content_block_start` / `content_block_delta` / `content_block_stop` / `message_delta` / `message_stop` 完整事件序列
 - 文本增量：`delta.content` → `text_delta`
 - 工具调用增量：`tool_calls[].function.arguments` → `input_json_delta`
+- 跨 chunk 的不完整 SSE 行自动拼接
+
+### 请求方向（Anthropic → Gemini）
+
+- `system` 字段 → `systemInstruction.parts`
+- `tool_use` 块 → 文本表示 `[Tool call: name(args)]`（Gemini 输入侧不支持 functionCall，用文本占位）
+- `tool_result` 块 → 文本表示 `[Tool result for name]: content`
+- `input_schema` → `functionDeclarations` 参数（剔除 Gemini 不支持的 schema 字段，仅保留 type/description/enum/format/default/items/properties/required/anyOf/allOf/oneOf）
+- `image` 块（base64）→ `inlineData`
+- `max_tokens` → `generationConfig.maxOutputTokens`，`temperature`/`top_p`/`stop_sequences` 同步映射
+- `tool_choice` 映射（`auto` → `AUTO`，`any` → `ANY`，`{type:"tool",name}` → `ANY + allowedFunctionNames`）
+- 流式请求自动走 `streamGenerateContent?alt=sse` 端点
+- `role` 映射：`assistant` → `model`
+
+### 响应方向（Gemini → Anthropic）
+
+- `candidates[0].content.parts` → `content` 数组
+- `part.text`（含 `thought` 标记）→ `thinking` 块
+- `part.text` → `text` 块
+- `part.functionCall` → `tool_use` 块（`args` → `input`，自动生成 `toolu_` ID）
+- `finishReason` 映射（`STOP` → `end_turn`，`MAX_TOKENS` → `max_tokens`，`TOOL_USE` → `tool_use`；若响应含 tool_use 则 `end_turn` 自动改为 `tool_use`）
+- `usageMetadata` 映射（`promptTokenCount` → `input_tokens`，`candidatesTokenCount` → `output_tokens`，`cachedContentTokenCount` → `cache_read_input_tokens`）
+
+### 流式转换（Gemini SSE → Anthropic SSE）
+
+- 完整 `message_start` / `content_block_*` / `message_delta` / `message_stop` 事件序列
+- thinking 增量：`part.thought` + `part.text` → `thinking_delta`
+- 文本增量：`part.text` → `text_delta`
+- 工具调用：`part.functionCall` → 整块 `content_block_start` + `input_json_delta`（一次性输出完整 args）
+- `finishReason` 触发 `message_delta`（含 stop_reason 修正）与 `message_stop`
 - 跨 chunk 的不完整 SSE 行自动拼接
 
 ### Anthropic 同协议透传
@@ -493,8 +523,8 @@ src/
   logger.ts     请求日志、累计 token 统计
 tests/
   config.test.ts    配置校验测试（5 例）
-  router.test.ts    模型解析 + 规则路由测试（19 例）
-  transform.test.ts 协议转换测试（21 例）
+  router.test.ts    模型解析 + 规则路由 + gemini 转发测试（25 例）
+  transform.test.ts 协议转换测试（OpenAI + Gemini，52 例）
   sse-usage.test.ts SSE usage 提取测试（9 例）
   server.test.ts    服务启动测试（1 例）
   cli.test.ts       进程管理测试（6 例）
@@ -503,11 +533,30 @@ tests/
 ## 开发
 
 ```bash
-npm run dev        # tsx 直接运行
-npm run build      # esbuild 打包到 dist/
+npm run dev        # tsx 直接运行（开发调试，不走 dist）
+npm run build      # esbuild 打包到 dist/cli.js
 npm run typecheck  # tsc 类型检查
-npm test           # vitest 运行测试（61 例）
+npm test           # vitest 运行测试（98 例）
 ```
+
+### 改完代码必须 rebuild + 重启网关
+
+`mccr` 全局命令指向 `dist/cli.js`（打包产物），**不是** `src/*.ts`。改完源码后如果不重新 build，运行中的网关仍跑旧代码，问题不会修复。
+
+```bash
+# 1. 重新打包
+npm run build
+
+# 2. 停掉旧网关
+mccr stop
+
+# 3. 用新代码启动
+mccr start
+```
+
+> **坑点**：`mccr stop` 只停 `~/.config/mccr/gateway.pid` 记录的进程。如果是用 `--config` 指定了其他配置文件启动的，或手动 `node dist/cli.js` 前台起的，`mccr stop` 可能停不掉，需要手动 `kill <PID>`。确认旧进程彻底退出后再启动，否则端口冲突或新代码不生效。
+>
+> 验证新代码生效：`curl http://127.0.0.1:<port>/health` 确认网关在线，再发一个测试请求看日志里是否走了新逻辑。
 
 ## 许可证
 

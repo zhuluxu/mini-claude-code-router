@@ -4,7 +4,7 @@ import { Readable, Transform } from "node:stream";
 import type { Config } from "./types.js";
 import { executeWithFallback, type ForwardResult } from "./router.js";
 import { logRequest, initLogger } from "./logger.js";
-import { OpenAIToAnthropicSseTransformer, parseSseChunk } from "./transform.js";
+import { OpenAIToAnthropicSseTransformer, GeminiToAnthropicSseTransformer, parseSseChunk } from "./transform.js";
 import { AnthropicSseUsageExtractor } from "./sse-usage.js";
 
 export async function startServer(config: Config): Promise<HttpServer> {
@@ -129,12 +129,16 @@ async function writeResultToResponse(
       result.responseStream as unknown as import("node:stream/web").ReadableStream
     );
 
-    let transformer: OpenAIToAnthropicSseTransformer | null = null;
+    let transformer: OpenAIToAnthropicSseTransformer | GeminiToAnthropicSseTransformer | null = null;
     let usageExtractor: AnthropicSseUsageExtractor | null = null;
 
     if (result.needsSseTransform && result.transformModel) {
       // Cross-protocol: pipe through SSE transformer (which also tracks usage)
-      transformer = new OpenAIToAnthropicSseTransformer(result.transformModel);
+      if (result.providerType === "gemini_generate_content") {
+        transformer = new GeminiToAnthropicSseTransformer(result.transformModel);
+      } else {
+        transformer = new OpenAIToAnthropicSseTransformer(result.transformModel);
+      }
       const transformStream = createSseTransformStream(transformer);
       nodeStream.pipe(transformStream).pipe(res);
     } else {
@@ -177,7 +181,9 @@ async function writeResultToResponse(
   res.end(result.body);
 }
 
-function createSseTransformStream(transformer: OpenAIToAnthropicSseTransformer): Transform {
+function createSseTransformStream(
+  transformer: OpenAIToAnthropicSseTransformer | GeminiToAnthropicSseTransformer
+): Transform {
   let carry = "";
 
   return new Transform({

@@ -1,6 +1,6 @@
-import { describe, it, expect, vi } from "vitest";
-import { resolveModel, evaluateRules } from "../src/router.js";
-import type { Config, RouterRule } from "../src/types.js";
+import { describe, it, expect, vi, afterEach } from "vitest";
+import { resolveModel, evaluateRules, forwardRequest } from "../src/router.js";
+import type { Config, RouterRule, ResolvedProvider } from "../src/types.js";
 
 const mockConfig: Config = {
   server: { host: "127.0.0.1", port: 3456 },
@@ -189,6 +189,152 @@ describe("router", () => {
     it("should return condition in match result", () => {
       const result = evaluateRules({ thinking: true, messages: [] }, "default", rules);
       expect(result?.condition).toEqual({ thinking: true });
+    });
+  });
+
+  describe("forwardRequest with gemini", () => {
+    const geminiProvider: ResolvedProvider = {
+      name: "gemini-test",
+      type: "gemini_generate_content",
+      baseUrl: "https://gemini.example.com",
+      apiKey: "secret-key",
+      model: "gemini-3.5-flash"
+    };
+
+    afterEach(() => {
+      vi.unstubAllGlobals();
+    });
+
+    it("should build correct URL with model in path for non-streaming", async () => {
+      const mockResponse = new Response(JSON.stringify({
+        candidates: [{
+          content: { role: "model", parts: [{ text: "Hi" }] },
+          finishReason: "STOP"
+        }],
+        usageMetadata: { promptTokenCount: 10, candidatesTokenCount: 5 }
+      }), { status: 200, headers: { "content-type": "application/json" } });
+
+      const fetchSpy = vi.fn().mockResolvedValue(mockResponse);
+      vi.stubGlobal("fetch", fetchSpy);
+
+      await forwardRequest(
+        { method: "POST", path: "/v1/messages", headers: { "content-type": "application/json" }, body: JSON.stringify({ model: "claude-opus-4", messages: [{ role: "user", content: "Hi" }] }) },
+        geminiProvider
+      );
+
+      const [url] = fetchSpy.mock.calls[0];
+      expect(url).toBe("https://gemini.example.com/v1/models/gemini-3.5-flash:generateContent");
+    });
+
+    it("should transform request body to Gemini format", async () => {
+      const mockResponse = new Response(JSON.stringify({
+        candidates: [{ content: { role: "model", parts: [{ text: "Hi" }] }, finishReason: "STOP" }]
+      }), { status: 200, headers: { "content-type": "application/json" } });
+
+      const fetchSpy = vi.fn().mockResolvedValue(mockResponse);
+      vi.stubGlobal("fetch", fetchSpy);
+
+      await forwardRequest(
+        { method: "POST", path: "/v1/messages", headers: { "content-type": "application/json" }, body: JSON.stringify({ model: "claude-opus-4", messages: [{ role: "user", content: "Hi" }], max_tokens: 100 }) },
+        geminiProvider
+      );
+
+      const [, options] = fetchSpy.mock.calls[0];
+      const sentBody = JSON.parse(options.body);
+      expect(sentBody.contents).toBeDefined();
+      expect(sentBody.contents[0].parts).toEqual([{ text: "Hi" }]);
+      expect(sentBody.model).toBeUndefined();
+      expect(sentBody.generationConfig.maxOutputTokens).toBe(100);
+    });
+
+    it("should transform Gemini response to Anthropic format", async () => {
+      const mockResponse = new Response(JSON.stringify({
+        candidates: [{
+          content: { role: "model", parts: [{ text: "Hello!" }] },
+          finishReason: "STOP"
+        }],
+        usageMetadata: { promptTokenCount: 10, candidatesTokenCount: 20 }
+      }), { status: 200, headers: { "content-type": "application/json" } });
+
+      const fetchSpy = vi.fn().mockResolvedValue(mockResponse);
+      vi.stubGlobal("fetch", fetchSpy);
+
+      const result = await forwardRequest(
+        { method: "POST", path: "/v1/messages", headers: { "content-type": "application/json" }, body: JSON.stringify({ model: "claude", messages: [{ role: "user", content: "Hi" }] }) },
+        geminiProvider
+      );
+
+      expect(result.status).toBe(200);
+      expect(result.isStreaming).toBe(false);
+      expect(result.providerType).toBe("gemini_generate_content");
+
+      const parsedBody = JSON.parse(result.body!);
+      expect(parsedBody.type).toBe("message");
+      expect(parsedBody.content).toEqual([{ type: "text", text: "Hello!" }]);
+      expect(parsedBody.usage.input_tokens).toBe(10);
+      expect(parsedBody.usage.output_tokens).toBe(20);
+    });
+
+    it("should build streaming URL with alt=sse for streaming requests", async () => {
+      const mockStream = new ReadableStream({
+        start(controller) {
+          controller.close();
+        }
+      });
+      const mockResponse = new Response(mockStream, {
+        status: 200,
+        headers: { "content-type": "text/event-stream" }
+      });
+
+      const fetchSpy = vi.fn().mockResolvedValue(mockResponse);
+      vi.stubGlobal("fetch", fetchSpy);
+
+      const result = await forwardRequest(
+        { method: "POST", path: "/v1/messages", headers: { "content-type": "application/json" }, body: JSON.stringify({ model: "claude", messages: [{ role: "user", content: "Hi" }], stream: true }) },
+        geminiProvider
+      );
+
+      const [url] = fetchSpy.mock.calls[0];
+      expect(url).toBe("https://gemini.example.com/v1/models/gemini-3.5-flash:streamGenerateContent?alt=sse");
+      expect(result.isStreaming).toBe(true);
+      expect(result.needsSseTransform).toBe(true);
+      expect(result.providerType).toBe("gemini_generate_content");
+    });
+
+    it("should use x-goog-api-key header for gemini auth", async () => {
+      const mockResponse = new Response(JSON.stringify({
+        candidates: [{ content: { role: "model", parts: [{ text: "Hi" }] }, finishReason: "STOP" }]
+      }), { status: 200, headers: { "content-type": "application/json" } });
+
+      const fetchSpy = vi.fn().mockResolvedValue(mockResponse);
+      vi.stubGlobal("fetch", fetchSpy);
+
+      await forwardRequest(
+        { method: "POST", path: "/v1/messages", headers: { "content-type": "application/json", "x-api-key": "client-key" }, body: JSON.stringify({ model: "claude", messages: [{ role: "user", content: "Hi" }] }) },
+        geminiProvider
+      );
+
+      const [, options] = fetchSpy.mock.calls[0];
+      expect(options.headers["x-goog-api-key"]).toBe("secret-key");
+      expect(options.headers["authorization"]).toBeUndefined();
+    });
+
+    it("should not include stream field in transformed Gemini body", async () => {
+      const mockResponse = new Response(JSON.stringify({
+        candidates: [{ content: { role: "model", parts: [{ text: "Hi" }] }, finishReason: "STOP" }]
+      }), { status: 200, headers: { "content-type": "application/json" } });
+
+      const fetchSpy = vi.fn().mockResolvedValue(mockResponse);
+      vi.stubGlobal("fetch", fetchSpy);
+
+      await forwardRequest(
+        { method: "POST", path: "/v1/messages", headers: { "content-type": "application/json" }, body: JSON.stringify({ model: "claude", messages: [{ role: "user", content: "Hi" }], stream: false }) },
+        geminiProvider
+      );
+
+      const [, options] = fetchSpy.mock.calls[0];
+      const sentBody = JSON.parse(options.body);
+      expect(sentBody.stream).toBeUndefined();
     });
   });
 });

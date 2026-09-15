@@ -185,7 +185,7 @@ EOF
 | `anthropic_messages` | Anthropic 官方 API，或任何原生兼容 Anthropic Messages 协议的端点 | 同协议透传，只替换 model 和鉴权，不改动请求体 |
 | `openai_chat_completions` | DeepSeek、通义千问、mimo、OpenRouter 等 OpenAI 兼容端点 | 自动协议转换，Anthropic 请求体转 OpenAI 格式，响应再转回来 |
 | `openai_responses` | OpenAI Responses API（实验性） | 协议转换，当前复用 Chat Completions 转换逻辑 |
-| `gemini_generate_content` | Google Gemini API | 仅替换鉴权和 model，不做格式转换 |
+| `gemini_generate_content` | Google Gemini API | 自动协议转换，Anthropic 请求体转 Gemini generateContent 格式，响应再转回来（含流式） |
 
 **怎么判断该选哪个？** 看你的上游 API 文档：
 

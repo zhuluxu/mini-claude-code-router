@@ -41,3 +41,44 @@ Skills 位于 `.claude/skills/` 目录，每个 skill 有独立的 `SKILL.md` �
 
 如果你认为哪怕只有 1% 的可能性某个 skill 适用于你正在做的事情，你必须调用该 skill 检查。
 <!-- superpowers-zh:end -->
+
+<!-- project-notes:begin -->
+# 项目备忘
+
+## 陷阱：settings.local.json 的 env 会覆盖网关变量（2026-07-10 排查）
+
+### 现象
+执行 `claude` 或 `mccr claude` 时，没有走本地 mccr 网关（`127.0.0.1:13456`）配置的默认模型（glm-5.2），而是用了 `qwen3.7-plus`。
+
+### 根因
+项目级 `.claude/settings.local.json` 的 `env` 字段硬编码了一组变量，**绕过本地网关直连 opencode.ai 官方网关**：
+
+```json
+"env": {
+  "ANTHROPIC_BASE_URL": "https://opencode.ai/zen/go",
+  "ANTHROPIC_AUTH_TOKEN": "sk-...",
+  "ANTHROPIC_API_KEY": "sk-...",
+  "ANTHROPIC_MODEL": "qwen3.7-plus"
+}
+```
+
+Claude Code 启动时会把项目 `settings.local.json` 的 `env` 覆盖到进程环境变量，优先级高于：
+- `~/.bashrc` 里的 `ANTHROPIC_BASE_URL=http://127.0.0.1:13456`
+- `mccr claude`（src/cli.ts:228-230）手动设置的网关地址
+
+所以无论 `claude` 还是 `mccr claude`，都被覆盖成直连 opencode + qwen3.7-plus。
+
+### 证据
+1. 网关日志 `/root/.config/mccr/gateway.log`：重启后只有 `GET /health` / `HEAD /`，无 `POST /v1/messages` 流量。
+2. `~/.claude.json` 本项目 `lastModelUsage` = `qwen3.7-plus`，与 settings.local.json 的 `ANTHROPIC_MODEL` 吻合。
+3. 全局 `~/.claude/settings.json` 的 `env` 为空 → 覆盖源就是项目级 settings.local.json。
+
+### 修复
+删除 `.claude/settings.local.json` 中 `env` 里的 `ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_API_KEY` / `ANTHROPIC_MODEL` 四个键，让 `~/.bashrc` 的网关变量生效。
+
+### 提醒
+- 网关配置文件：`/root/.config/mccr/config.json`（`defaultModel` = `opencode-glm-5.2/glm-5.2`）
+- 网关日志：`/root/.config/mccr/gateway.log`
+- 排查"流量是否经过网关"：看日志里有没有 `POST /v1/messages` 行。
+- 不要在本项目 `.claude/settings.local.json` 的 `env` 里设任何 `ANTHROPIC_*` 变量，否则会覆盖网关。
+<!-- project-notes:end -->
