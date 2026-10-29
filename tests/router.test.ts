@@ -192,6 +192,227 @@ describe("router", () => {
     });
   });
 
+  describe("forwardRequest opencode session headers", () => {
+    const opencodeOpenAIProvider: ResolvedProvider = {
+      name: "opencode-glm-5.2",
+      type: "openai_chat_completions",
+      baseUrl: "https://opencode.ai/zen/go",
+      apiKey: "sk-test",
+      model: "glm-5.2"
+    };
+
+    const opencodeAnthropicProvider: ResolvedProvider = {
+      name: "opencode-qwen-plus",
+      type: "anthropic_messages",
+      baseUrl: "https://opencode.ai/zen/go",
+      apiKey: "sk-test",
+      model: "qwen3.7-plus"
+    };
+
+    function stubOpenAISuccess() {
+      const fetchSpy = vi.fn().mockImplementation(() =>
+        Promise.resolve(
+          new Response(
+            JSON.stringify({
+              choices: [{ message: { role: "assistant", content: "hi" }, finish_reason: "stop" }]
+            }),
+            { status: 200, headers: { "content-type": "application/json" } }
+          )
+        )
+      );
+      vi.stubGlobal("fetch", fetchSpy);
+      return fetchSpy;
+    }
+
+    afterEach(() => {
+      vi.unstubAllGlobals();
+    });
+
+    it("derives x-opencode-session from Claude Code metadata.user_id and forwards user-agent (cross-protocol)", async () => {
+      const fetchSpy = stubOpenAISuccess();
+
+      await forwardRequest(
+        {
+          method: "POST",
+          path: "/v1/messages",
+          headers: { "content-type": "application/json", "user-agent": "claude-cli/2.1.0" },
+          body: JSON.stringify({
+            model: "claude",
+            metadata: { user_id: "user_abc_account__session_11111111-2222-3333-4444-555555555555" },
+            messages: [{ role: "user", content: "Hi" }]
+          })
+        },
+        opencodeOpenAIProvider
+      );
+
+      const [, options] = fetchSpy.mock.calls[0];
+      expect(options.headers["x-opencode-session"]).toBe("11111111-2222-3333-4444-555555555555");
+      expect(options.headers["user-agent"]).toBe("claude-cli/2.1.0");
+    });
+
+    it("forwards an existing x-opencode-session header", async () => {
+      const fetchSpy = stubOpenAISuccess();
+
+      await forwardRequest(
+        {
+          method: "POST",
+          path: "/v1/messages",
+          headers: { "content-type": "application/json", "x-opencode-session": "ses_explicit" },
+          body: JSON.stringify({ model: "claude", messages: [{ role: "user", content: "Hi" }] })
+        },
+        opencodeOpenAIProvider
+      );
+
+      const [, options] = fetchSpy.mock.calls[0];
+      expect(options.headers["x-opencode-session"]).toBe("ses_explicit");
+    });
+
+    it("injects x-opencode-session for anthropic_messages opencode provider", async () => {
+      const mockResponse = new Response(
+        JSON.stringify({ type: "message", content: [{ type: "text", text: "hi" }] }),
+        { status: 200, headers: { "content-type": "application/json" } }
+      );
+      const fetchSpy = vi.fn().mockResolvedValue(mockResponse);
+      vi.stubGlobal("fetch", fetchSpy);
+
+      await forwardRequest(
+        {
+          method: "POST",
+          path: "/v1/messages",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            model: "claude",
+            metadata: { user_id: "user_x_account__session_deadbeef" },
+            messages: [{ role: "user", content: "Hi" }]
+          })
+        },
+        opencodeAnthropicProvider
+      );
+
+      const [, options] = fetchSpy.mock.calls[0];
+      expect(options.headers["x-opencode-session"]).toBe("deadbeef");
+    });
+
+    it("does not add x-opencode-session for non-opencode providers", async () => {
+      const openrouterProvider: ResolvedProvider = {
+        name: "openrouter",
+        type: "openai_chat_completions",
+        baseUrl: "https://openrouter.ai/api/v1",
+        apiKey: "sk-test",
+        model: "anthropic/claude-sonnet-4"
+      };
+      const fetchSpy = stubOpenAISuccess();
+
+      await forwardRequest(
+        {
+          method: "POST",
+          path: "/v1/messages",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ model: "claude", messages: [{ role: "user", content: "Hi" }] })
+        },
+        openrouterProvider
+      );
+
+      const [, options] = fetchSpy.mock.calls[0];
+      expect(options.headers["x-opencode-session"]).toBeUndefined();
+    });
+
+    it("produces a stable session id when no session info is available", async () => {
+      const fetchSpy = stubOpenAISuccess();
+
+      const body = JSON.stringify({ model: "claude", messages: [{ role: "user", content: "Hi" }] });
+
+      await forwardRequest(
+        { method: "POST", path: "/v1/messages", headers: { "content-type": "application/json" }, body },
+        opencodeOpenAIProvider
+      );
+      await forwardRequest(
+        { method: "POST", path: "/v1/messages", headers: { "content-type": "application/json" }, body },
+        opencodeOpenAIProvider
+      );
+
+      const first = fetchSpy.mock.calls[0][1].headers["x-opencode-session"];
+      const second = fetchSpy.mock.calls[1][1].headers["x-opencode-session"];
+      expect(first).toBeDefined();
+      expect(first).toBe(second);
+    });
+  });
+
+  describe("forwardRequest accept-encoding handling", () => {
+    const anthropicProvider: ResolvedProvider = {
+      name: "deepseek-v4-pro",
+      type: "anthropic_messages",
+      baseUrl: "https://api.deepseek.com/anthropic",
+      apiKey: "test-key",
+      model: "deepseek-v4-pro"
+    };
+
+    const openaiProvider: ResolvedProvider = {
+      name: "openrouter",
+      type: "openai_chat_completions",
+      baseUrl: "https://openrouter.ai/api/v1",
+      apiKey: "test-key",
+      model: "anthropic/claude-sonnet-4"
+    };
+
+    afterEach(() => {
+      vi.unstubAllGlobals();
+    });
+
+    function stubSuccess() {
+      const fetchSpy = vi.fn().mockResolvedValue(
+        new Response(JSON.stringify({ ok: true }), {
+          status: 200,
+          headers: { "content-type": "application/json" }
+        })
+      );
+      vi.stubGlobal("fetch", fetchSpy);
+      return fetchSpy;
+    }
+
+    it("does not forward client accept-encoding for anthropic passthrough", async () => {
+      const fetchSpy = stubSuccess();
+
+      await forwardRequest(
+        {
+          method: "POST",
+          path: "/v1/messages",
+          headers: {
+            "content-type": "application/json",
+            "accept-encoding": "gzip, deflate, br, zstd"
+          },
+          body: JSON.stringify({ model: "claude", messages: [{ role: "user", content: "Hi" }] })
+        },
+        anthropicProvider
+      );
+
+      const [, options] = fetchSpy.mock.calls[0];
+      expect(options.headers["accept-encoding"]).toBeUndefined();
+      expect(options.headers["Accept-Encoding"]).toBeUndefined();
+    });
+
+    it("does not forward client accept-encoding for cross-protocol", async () => {
+      const fetchSpy = stubSuccess();
+
+      await forwardRequest(
+        {
+          method: "POST",
+          path: "/v1/messages",
+          headers: {
+            "content-type": "application/json",
+            "accept-encoding": "gzip, deflate, br, zstd"
+          },
+          body: JSON.stringify({ model: "claude", messages: [{ role: "user", content: "Hi" }] })
+        },
+        openaiProvider
+      );
+
+      const [, options] = fetchSpy.mock.calls[0];
+      expect(options.headers["accept-encoding"]).toBeUndefined();
+      expect(options.headers["Accept-Encoding"]).toBeUndefined();
+    });
+  });
+
   describe("forwardRequest with gemini", () => {
     const geminiProvider: ResolvedProvider = {
       name: "gemini-test",

@@ -138,6 +138,9 @@ function validateRouterRule(raw, index) {
 import { createServer } from "node:http";
 import { Readable, Transform } from "node:stream";
 
+// src/router.ts
+import { createHash } from "node:crypto";
+
 // src/transform.ts
 function transformRequestToOpenAI(body) {
   const out = {};
@@ -899,6 +902,56 @@ function parseSseChunk(raw, carry) {
 }
 
 // src/router.ts
+var SESSION_HEADER_NAMES = [
+  "x-opencode-session",
+  "x-claude-code-session-id",
+  "x-session-id",
+  "session-id",
+  "x-conversation-id"
+];
+function isOpencodeHost(baseUrl) {
+  try {
+    const host = new URL(baseUrl).hostname.toLowerCase();
+    return host === "opencode.ai" || host.endsWith(".opencode.ai");
+  } catch {
+    return false;
+  }
+}
+function resolveOpencodeSession(headers, body) {
+  const lower = {};
+  for (const [key, value] of Object.entries(headers)) {
+    lower[key.toLowerCase()] = value;
+  }
+  for (const name of SESSION_HEADER_NAMES) {
+    const value = lower[name];
+    if (value) return value;
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(body);
+  } catch {
+    parsed = void 0;
+  }
+  const userId = parsed?.metadata?.user_id;
+  if (typeof userId === "string" && userId) {
+    const match = userId.match(/session_([A-Za-z0-9-]+)/);
+    return match ? match[1] : userId;
+  }
+  const seed = sessionSeed(parsed);
+  if (!seed) return void 0;
+  return createHash("sha256").update(seed).digest("hex").slice(0, 32);
+}
+function sessionSeed(parsed) {
+  if (!parsed || typeof parsed !== "object") return "";
+  const system = typeof parsed.system === "string" ? parsed.system : JSON.stringify(parsed.system ?? "");
+  const firstUser = Array.isArray(parsed.messages) ? parsed.messages.find((m) => m?.role === "user") : void 0;
+  let userText = "";
+  if (firstUser) {
+    userText = typeof firstUser.content === "string" ? firstUser.content : JSON.stringify(firstUser.content ?? "");
+  }
+  if (!system && !userText) return "";
+  return `${system}|${userText}`;
+}
 function resolveModel(selector, config) {
   if (!selector) {
     return resolveModel(config.router.defaultModel, config);
@@ -987,6 +1040,8 @@ async function forwardRequest(request, resolved) {
     targetPath = `/v1/models/${resolved.model}:generateContent`;
   }
   const url = `${resolved.baseUrl}${targetPath}`;
+  const opencodeHost = isOpencodeHost(resolved.baseUrl);
+  const sessionId = opencodeHost ? resolveOpencodeSession(request.headers, request.body) : void 0;
   const headers = {};
   if (isAnthropicProtocol) {
     for (const [key, value] of Object.entries(request.headers)) {
@@ -994,6 +1049,7 @@ async function forwardRequest(request, resolved) {
       if (lower === "x-api-key" || lower === "authorization") continue;
       if (lower === "content-length") continue;
       if (lower === "host") continue;
+      if (lower === "accept-encoding") continue;
       headers[key] = value;
     }
     headers["x-api-key"] = resolved.apiKey;
@@ -1012,9 +1068,19 @@ async function forwardRequest(request, resolved) {
     for (const [key, value] of Object.entries(request.headers)) {
       const lower = key.toLowerCase();
       if (lower === "x-api-key" || lower === "authorization" || lower === "content-length" || lower === "host") continue;
+      if (lower === "accept-encoding") continue;
       headers[key] = value;
     }
     headers["x-api-key"] = resolved.apiKey;
+  }
+  if (sessionId) {
+    for (const key of Object.keys(headers)) {
+      if (SESSION_HEADER_NAMES.includes(key.toLowerCase())) delete headers[key];
+    }
+    headers["x-opencode-session"] = sessionId;
+  }
+  if ((isCrossProtocol || isGemini) && request.headers["user-agent"]) {
+    headers["user-agent"] = request.headers["user-agent"];
   }
   if (request.method !== "GET" && bodyToSend) {
     headers["content-length"] = String(Buffer.byteLength(bodyToSend, "utf8"));

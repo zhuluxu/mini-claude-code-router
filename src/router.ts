@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type { Config, ResolvedProvider, RouterRule, RouterRuleCondition } from "./types.js";
 import {
   transformRequestToOpenAI,
@@ -5,6 +6,78 @@ import {
   transformRequestToGemini,
   transformResponseFromGemini
 } from "./transform.js";
+
+// Headers that may carry a per-conversation session id. OpenCode Go requires
+// `x-opencode-session` (stable per conversation) for routing / prompt caching.
+const SESSION_HEADER_NAMES = [
+  "x-opencode-session",
+  "x-claude-code-session-id",
+  "x-session-id",
+  "session-id",
+  "x-conversation-id"
+];
+
+function isOpencodeHost(baseUrl: string): boolean {
+  try {
+    const host = new URL(baseUrl).hostname.toLowerCase();
+    return host === "opencode.ai" || host.endsWith(".opencode.ai");
+  } catch {
+    return false;
+  }
+}
+
+// Compute a stable session id for OpenCode Go requests. Prefers an explicit
+// session header, then Claude Code's native session embedded in
+// metadata.user_id, then a content hash keyed on the system prompt + first user
+// turn (stable across the many turns of one conversation).
+export function resolveOpencodeSession(
+  headers: Record<string, string>,
+  body: string
+): string | undefined {
+  const lower: Record<string, string> = {};
+  for (const [key, value] of Object.entries(headers)) {
+    lower[key.toLowerCase()] = value;
+  }
+  for (const name of SESSION_HEADER_NAMES) {
+    const value = lower[name];
+    if (value) return value;
+  }
+
+  let parsed: any;
+  try {
+    parsed = JSON.parse(body);
+  } catch {
+    parsed = undefined;
+  }
+
+  const userId = parsed?.metadata?.user_id;
+  if (typeof userId === "string" && userId) {
+    const match = userId.match(/session_([A-Za-z0-9-]+)/);
+    return match ? match[1] : userId;
+  }
+
+  const seed = sessionSeed(parsed);
+  if (!seed) return undefined;
+  return createHash("sha256").update(seed).digest("hex").slice(0, 32);
+}
+
+function sessionSeed(parsed: any): string {
+  if (!parsed || typeof parsed !== "object") return "";
+  const system =
+    typeof parsed.system === "string" ? parsed.system : JSON.stringify(parsed.system ?? "");
+  const firstUser = Array.isArray(parsed.messages)
+    ? parsed.messages.find((m: any) => m?.role === "user")
+    : undefined;
+  let userText = "";
+  if (firstUser) {
+    userText =
+      typeof firstUser.content === "string"
+        ? firstUser.content
+        : JSON.stringify(firstUser.content ?? "");
+  }
+  if (!system && !userText) return "";
+  return `${system}|${userText}`;
+}
 
 // ---------------------------------------------------------------------------
 // Types
@@ -159,6 +232,9 @@ export async function forwardRequest(
 
   const url = `${resolved.baseUrl}${targetPath}`;
 
+  const opencodeHost = isOpencodeHost(resolved.baseUrl);
+  const sessionId = opencodeHost ? resolveOpencodeSession(request.headers, request.body) : undefined;
+
   // Build headers
   const headers: Record<string, string> = {};
 
@@ -169,6 +245,10 @@ export async function forwardRequest(
       if (lower === "x-api-key" || lower === "authorization") continue;
       if (lower === "content-length") continue;
       if (lower === "host") continue;
+      // Never negotiate upstream compression: undici leaves the body encoded
+      // when the caller supplies accept-encoding, but we strip content-encoding
+      // from the response, so the client would receive undecodable bytes.
+      if (lower === "accept-encoding") continue;
       headers[key] = value;
     }
     // Set our auth
@@ -191,9 +271,24 @@ export async function forwardRequest(
     for (const [key, value] of Object.entries(request.headers)) {
       const lower = key.toLowerCase();
       if (lower === "x-api-key" || lower === "authorization" || lower === "content-length" || lower === "host") continue;
+      if (lower === "accept-encoding") continue;
       headers[key] = value;
     }
     headers["x-api-key"] = resolved.apiKey;
+  }
+
+  // Normalize the OpenCode Go session header (single canonical name/case).
+  if (sessionId) {
+    for (const key of Object.keys(headers)) {
+      if (SESSION_HEADER_NAMES.includes(key.toLowerCase())) delete headers[key];
+    }
+    headers["x-opencode-session"] = sessionId;
+  }
+
+  // Cross-protocol/gemini requests drop most client headers; preserve the user
+  // agent so OpenCode Go can identify the calling agent.
+  if ((isCrossProtocol || isGemini) && request.headers["user-agent"]) {
+    headers["user-agent"] = request.headers["user-agent"];
   }
 
   // Set content-length for modified body
